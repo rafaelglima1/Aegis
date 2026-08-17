@@ -10,7 +10,7 @@ from aegis.domain.enums import OrderSide, OrderStatus, TradingAction
 from aegis.execution.sandbox import SandboxBroker
 from aegis.execution.engine import ExecutionEngine
 from aegis.execution.orchestrator import ExecutionOrchestrator, OrderState
-from aegis.risk_engine.risk_engine import RiskEngine
+from aegis.risk_engine.risk_engine import RiskEngine, RiskDecision
 from aegis.risk_engine.risk_limits import RiskLimits
 from aegis.portfolio.portfolio import Portfolio
 from aegis.replay import ReplayEngine, ReplayDataset, Candle, ReplayState
@@ -63,7 +63,7 @@ async def test_sandbox_pipeline_e2e() -> None:
         quantity=Decimal("1"),
         price=Decimal("50.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     assert result.status == OrderStatus.FILLED
 
@@ -109,7 +109,7 @@ async def test_market_data_to_audit_e2e() -> None:
         quantity=Decimal("10"),
         price=Decimal("100.00"),
         correlation_id=correlation_id,
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     assert result.status == OrderStatus.FILLED
 
@@ -170,7 +170,7 @@ async def test_broker_failure_handled_safely() -> None:
         quantity=Decimal("10"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     assert result.status == OrderStatus.REJECTED
     assert "failure" in result.error

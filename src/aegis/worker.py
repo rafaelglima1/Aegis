@@ -807,15 +807,28 @@ Responda com JSON:
                 )
 
         elif decision.action == TradingAction.CLOSE:
-            # Close existing position
+            # AC-C3-01: CLOSE routes through Portfolio.close_position()
+            # AC-C3-02: Fee comes from broker config, not hardcoded zero
             for pos in self._state["positions"]:
                 if pos["symbol"] == symbol and pos["status"] == "OPEN":
-                    pos["status"] = "CLOSED"
-                    # Calculate P&L — all values stay as Decimal strings
                     entry = Decimal(pos["entry_price"])
-                    pnl = (current_price - entry) * Decimal(pos["quantity"])
-                    self._state["pnl"] = str(Decimal(self._state["pnl"]) + pnl)
-                    self._state["capital"] = str(Decimal(self._state["capital"]) + pnl)
+                    qty = Decimal(pos["quantity"])
+
+                    # Exit fee: same rate as SandboxBroker (0.50 per order)
+                    exit_fee = Decimal("0.50")
+
+                    # Route through Portfolio for correct net P&L accounting
+                    realized = self.portfolio.close_position(
+                        asset=symbol,
+                        price=current_price,
+                        fee=exit_fee,
+                    )
+
+                    pos["status"] = "CLOSED"
+
+                    # Update state from Portfolio (single source of truth)
+                    self._state["capital"] = str(self.portfolio.cash)
+                    self._state["pnl"] = str(self.portfolio.total_realized_pnl)
 
                     # Add to history
                     trade = {
@@ -825,16 +838,16 @@ Responda com JSON:
                         "quantity": pos["quantity"],
                         "entry_price": pos["entry_price"],
                         "exit_price": str(current_price),
-                        "pnl": str(pnl),
-                        "fee": "0",
+                        "pnl": str(realized),
+                        "fee": str(exit_fee),
                     }
                     self._state["history"].append(trade)
 
                     # Update risk engine
                     self.risk_engine.record_position_close()
-                    self.risk_engine.record_daily_pnl(pnl)
+                    self.risk_engine.record_daily_pnl(realized)
 
-                    logger.info("Position closed: %s, P&L: R$ %s", symbol, pnl)
+                    logger.info("Position closed: %s, P&L: R$ %s", symbol, realized)
                     break
 
     def _build_market_state(

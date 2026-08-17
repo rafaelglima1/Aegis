@@ -39,6 +39,7 @@ def create_broker(settings: Settings | None = None) -> BrokerAdapter:
             api_key=settings.live_api_key,
             api_secret=settings.live_api_secret,
             enabled=settings.live_enabled,
+            max_positions=settings.max_positions,
         )
         return MercadoBitcoinBroker(config)
 

@@ -10,6 +10,7 @@ from aegis.domain.enums import OrderSide, OrderStatus
 from aegis.execution.broker import BrokerAdapter, OrderSubmission, OrderResult
 from aegis.execution.sandbox import SandboxBroker
 from aegis.execution.engine import ExecutionEngine
+from aegis.risk_engine.risk_engine import RiskDecision
 
 
 def make_submission(**overrides) -> OrderSubmission:
@@ -118,10 +119,9 @@ async def test_broker_requires_risk_approval() -> None:
         quantity=Decimal("0.5"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=False,
     )
     assert result.status == OrderStatus.REJECTED
-    assert "Risk approval" in result.error
+    assert "Risk rejected" in result.error
 
 
 @pytest.mark.asyncio
@@ -129,6 +129,7 @@ async def test_broker_with_risk_approval() -> None:
     """AC-08.09: Broker cannot receive an order without Risk approval."""
     broker = SandboxBroker()
     engine = ExecutionEngine(broker)
+    approved = RiskDecision(status="APPROVED")
     result = await engine.execute_order(
         order_id=uuid4(),
         idempotency_key=uuid4(),
@@ -137,7 +138,7 @@ async def test_broker_with_risk_approval() -> None:
         quantity=Decimal("0.5"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=approved,
     )
     assert result.status == OrderStatus.FILLED
 

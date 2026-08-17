@@ -9,6 +9,7 @@ from uuid import uuid4
 from aegis.domain.enums import OrderSide, OrderStatus
 from aegis.execution.broker import BrokerAdapter, OrderSubmission, OrderResult, CancelResult
 from aegis.execution.orchestrator import ExecutionOrchestrator, OrderState, ReconciliationResult
+from aegis.risk_engine.risk_engine import RiskDecision
 
 
 class MockBroker(BrokerAdapter):
@@ -64,7 +65,6 @@ async def test_only_approved_intent_executed() -> None:
         quantity=Decimal("10"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=False,
     )
     assert result.status == OrderStatus.REJECTED
     assert "Risk approval" in result.error
@@ -83,7 +83,7 @@ async def test_uses_broker_adapter() -> None:
         quantity=Decimal("10"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     assert result.status == OrderStatus.FILLED
     assert len(broker._submitted) == 1
@@ -103,7 +103,7 @@ async def test_order_acknowledgement_processed() -> None:
         quantity=Decimal("10"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     state = orchestrator.get_order_state(order_id)
     assert state == OrderState.FILLED
@@ -123,7 +123,7 @@ async def test_full_fill_processed() -> None:
         quantity=Decimal("10"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     assert result.status == OrderStatus.FILLED
     assert result.fill_quantity == Decimal("10")
@@ -143,7 +143,7 @@ async def test_cancellation_processed() -> None:
         quantity=Decimal("10"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     result = await orchestrator.cancel_order(order_id, uuid4())
     assert result.success
@@ -190,7 +190,7 @@ async def test_restart_triggers_reconciliation() -> None:
         quantity=Decimal("10"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     results = await orchestrator.recover_on_restart()
     assert isinstance(results, list)
@@ -210,7 +210,7 @@ async def test_never_assumes_success() -> None:
         quantity=Decimal("10"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     state = orchestrator.get_order_state(order_id)
     assert state == OrderState.FILLED
@@ -231,7 +231,7 @@ async def test_idempotency_prevents_duplicate() -> None:
         quantity=Decimal("10"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     result2 = await orchestrator.submit_order(
         order_id=order_id,
@@ -241,7 +241,7 @@ async def test_idempotency_prevents_duplicate() -> None:
         quantity=Decimal("10"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     assert result1.status == OrderStatus.FILLED
     assert result2.status == OrderStatus.REJECTED
@@ -261,7 +261,6 @@ async def test_risk_failure_blocks_execution() -> None:
         quantity=Decimal("10"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=False,
     )
     assert result.status == OrderStatus.REJECTED
     assert len(broker._submitted) == 0

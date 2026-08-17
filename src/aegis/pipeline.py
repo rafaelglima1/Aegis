@@ -65,7 +65,7 @@ class TradingPipeline:
         self._portfolio = portfolio or Portfolio()
         self._audit = audit or AuditLogger()
         self._state: dict[str, Any] = {
-            "capital": str(Decimal("100.00")),
+            "capital": str(self._portfolio.cash),
             "positions": [],
             "orders": [],
             "history": [],

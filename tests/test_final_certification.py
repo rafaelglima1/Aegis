@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from aegis.config import Settings, TradingEnvironment
 from aegis.domain.enums import OrderSide, OrderStatus, TradingAction
-from aegis.domain.contracts import MarketState, OrderRequest, RiskDecision
+from aegis.domain.contracts import MarketState, OrderRequest
 from aegis.domain.state_machines import OrderStateMachine, PositionStateMachine
 from aegis.domain.events import DomainEvent
 from aegis.domain.time import utc_now, new_correlation_id, new_idempotency_key
@@ -18,7 +18,7 @@ from aegis.market_data.provider import Candle
 from aegis.ai_engine.provider import LLMProvider, LLMResponse
 from aegis.ai_engine.decision_engine import DecisionEngine, DecisionContract
 from aegis.ai_engine.prompt_manager import PromptManager
-from aegis.risk_engine.risk_engine import RiskEngine
+from aegis.risk_engine.risk_engine import RiskEngine, RiskDecision
 from aegis.risk_engine.risk_limits import RiskLimits
 from aegis.portfolio.portfolio import Portfolio
 from aegis.portfolio.accounting import Accounting
@@ -194,7 +194,7 @@ async def test_e2e_suite_passes() -> None:
         quantity=Decimal("0.5"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     assert result.status == OrderStatus.FILLED
 
@@ -288,7 +288,7 @@ async def test_sandbox_execution_certification() -> None:
         quantity=Decimal("0.5"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
-        risk_approved=True,
+        risk_decision=RiskDecision(status="APPROVED"),
     )
     assert result.status == OrderStatus.FILLED
 

@@ -25,7 +25,7 @@ class LiveBrokerConfig:
     enabled: bool = False
     max_order_size: Decimal = Decimal("10000.00")
     max_daily_loss: Decimal = Decimal("500.00")
-    max_positions: int = 5
+    max_positions: int = 0
     health_check_url: str = ""
 
 

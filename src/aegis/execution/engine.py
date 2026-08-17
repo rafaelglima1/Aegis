@@ -29,26 +29,14 @@ class ExecutionEngine:
         price: Decimal,
         correlation_id: UUID,
         risk_decision: RiskDecision | None = None,
-        risk_approved: bool = False,
     ) -> OrderResult:
         """AC-08.09: Broker cannot receive an order without Risk approval.
-
-        Accepts RiskDecision (preferred) or risk_approved bool (legacy).
-        RiskDecision is verified: only status="APPROVED" allows execution.
-        """
-        # Prefer RiskDecision authorization (non-repudiable)
-        if risk_decision is not None:
-            if not risk_decision.is_approved:
-                return OrderResult(
-                    order_id=order_id,
-                    status=OrderStatus.REJECTED,
-                    error=f"Risk rejected: {[v.code for v in risk_decision.violations]}",
-                )
-        elif not risk_approved:
+        AC-C3-03: RiskDecision is mandatory — no boolean fallback."""
+        if risk_decision is None or not risk_decision.is_approved:
             return OrderResult(
                 order_id=order_id,
                 status=OrderStatus.REJECTED,
-                error="Risk approval required",
+                error=f"Risk rejected: {[v.code for v in (risk_decision.violations if risk_decision else [])]}",
             )
 
         submission = OrderSubmission(

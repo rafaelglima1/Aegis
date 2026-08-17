@@ -12,25 +12,35 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 SETTINGS_FILE = Path("/home/ubuntu/aegis/.env.prod")
 PROMPT_FILE = Path("/home/ubuntu/aegis/prompt_template.txt")
 
-DEFAULT_PROMPT = """\
+
+def build_default_prompt(
+    capital: float = 100.0,
+    risk_pct: float = 1.0,
+    max_daily_loss_pct: float = 5.0,
+    max_position_size_pct: float = 20.0,
+    min_confidence: float = 0.5,
+    max_positions: int = 1,
+) -> str:
+    """AC-C3-07: Build fallback prompt from config values — no hardcoded financials."""
+    return f"""\
 Você é um trader de swing trade de criptomoedas. Analise os dados de mercado e tome uma decisão de trading.
 
 Dados de Mercado:
-{market_state}
+{{market_state}}
 
 Portfólio Atual:
-{portfolio}
+{{portfolio}}
 
 Regras:
 - Apenas LONG (sem SHORT)
-- Máximo 1 posição(ões) por vez
-- Risco de 1.0% por trade
-- Capital de referência: R$ 100.0
+- Máximo {max_positions} posição(ões) por vez
+- Risco de {risk_pct}% por trade
+- Capital de referência: R$ {capital}
 - Stop loss obrigatório
 - Take profit obrigatório
-- Só opera se confiança >= 50.0%
-- Perda diária máxima: 5.0% do capital
-- Tamanho máximo de posição: 20.0% do capital
+- Só opera se confiança >= {min_confidence}%
+- Perda diária máxima: {max_daily_loss_pct}% do capital
+- Tamanho máximo de posição: {max_position_size_pct}% do capital
 
 Responda com JSON:
 {{
@@ -42,6 +52,9 @@ Responda com JSON:
     "take_profit": número ou null,
     "reasoning": "análise detalhada"
 }}"""
+
+
+DEFAULT_PROMPT = build_default_prompt()
 
 
 class LLMSettings(BaseModel):

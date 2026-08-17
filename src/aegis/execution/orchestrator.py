@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 from aegis.domain.enums import OrderSide, OrderStatus
 from aegis.domain.contracts import utc_now
 from aegis.execution.broker import BrokerAdapter, OrderResult
+from aegis.risk_engine.risk_engine import RiskDecision
 
 
 class OrderState(Enum):
@@ -87,13 +88,13 @@ class ExecutionOrchestrator:
         quantity: Decimal,
         price: Decimal,
         correlation_id: UUID,
-        risk_approved: bool = False,
+        risk_decision: RiskDecision | None = None,
     ) -> OrderResult:
         """AC-10.01: Only Approved Order Intent can be executed.
         AC-10.10: Idempotency prevents duplicate order submission.
-        AC-FIN-14: Risk REJECT prevents Broker.submit_order."""
+        AC-C3-03: RiskDecision is mandatory — no boolean fallback."""
 
-        if not risk_approved:
+        if risk_decision is None or not risk_decision.is_approved:
             self._audit("order_rejected", {"reason": "RISK_NOT_APPROVED", "order_id": str(order_id)})
             return OrderResult(
                 order_id=order_id,

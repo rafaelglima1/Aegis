@@ -73,12 +73,14 @@ class ReplayEngine:
     """AC-11.01: Replay accepts a versioned dataset.
     AC-11.02: Replay preserves historical timestamps.
     AC-11.03: Replay uses only information available at each timestamp.
-    AC-11.04: Look-ahead is impossible or explicitly detected."""
+    AC-11.04: Look-ahead is impossible or explicitly detected.
+    AC-C3-06: Replay accepts configurable initial capital."""
 
-    def __init__(self) -> None:
+    def __init__(self, initial_capital: Decimal = Decimal("100.00")) -> None:
         self._datasets: dict[UUID, ReplayDataset] = {}
         self._results: dict[UUID, ReplayResult] = {}
         self._audit_log: list[dict[str, Any]] = []
+        self._initial_capital = initial_capital
 
     def register_dataset(self, dataset: ReplayDataset) -> UUID:
         """AC-11.01: Replay accepts a versioned dataset."""
@@ -115,8 +117,9 @@ class ReplayEngine:
         self._results[result.replay_id] = result
 
         # AC-11.09: Portfolio state can be reconstructed
+        # AC-C3-06: Uses configurable initial capital
         portfolio_state = {
-            "cash": Decimal("10000.00"),
+            "cash": self._initial_capital,
             "positions": {},
             "total_pnl": Decimal("0"),
         }

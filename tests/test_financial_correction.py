@@ -141,6 +141,7 @@ class TestFeePropagation:
         broker = SandboxBroker(initial_balance=Decimal("500.00"))
         engine = ExecutionEngine(broker)
 
+        approved = RiskDecision(status="APPROVED")
         result = await engine.execute_order(
             order_id=uuid4(),
             idempotency_key=uuid4(),
@@ -149,7 +150,7 @@ class TestFeePropagation:
             quantity=Decimal("0.001"),
             price=Decimal("50000"),
             correlation_id=uuid4(),
-            risk_approved=True,
+            risk_decision=approved,
         )
         assert result.status == OrderStatus.FILLED
         assert result.fee > Decimal("0")
@@ -305,29 +306,6 @@ class TestRiskGateHardening:
 
         assert result.status == OrderStatus.FILLED
         mock_broker.submit_order.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_bare_bool_fallback_still_works(self) -> None:
-        """Legacy risk_approved=True still works for backward compatibility."""
-        mock_broker = AsyncMock(spec=BrokerAdapter)
-        mock_broker.submit_order = AsyncMock(return_value=OrderResult(
-            order_id=uuid4(),
-            status=OrderStatus.FILLED,
-        ))
-
-        engine = ExecutionEngine(mock_broker)
-        result = await engine.execute_order(
-            order_id=uuid4(),
-            idempotency_key=uuid4(),
-            symbol="BTC-BRL",
-            side=OrderSide.BUY,
-            quantity=Decimal("0.001"),
-            price=Decimal("50000"),
-            correlation_id=uuid4(),
-            risk_approved=True,
-        )
-
-        assert result.status == OrderStatus.FILLED
 
 
 # ============================================================

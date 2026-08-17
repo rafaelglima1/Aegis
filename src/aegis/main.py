@@ -1041,7 +1041,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         function resetPrompt() {
             if (!confirm('Restaurar o prompt padrão? O prompt atual será perdido.')) return;
-            const defaultPrompt = `Você é um trader de swing trade de criptomoedas. Analise os dados de mercado e tome uma decisão de trading.
+            // AC-C3-07: Build prompt from live config, not hardcoded values
+            fetch('/api/settings').then(r => r.json()).then(cfg => {
+                const t = cfg.trading || {};
+                const cap = t.capital || 100;
+                const risk = t.risk_per_trade_pct || 1;
+                const maxPos = t.max_positions || 1;
+                const minConf = (t.min_confidence || 0.5) * 100;
+                const dailyLoss = t.max_daily_loss_pct || 5;
+                const posSize = t.max_position_size_pct || 20;
+                const defaultPrompt = `Você é um trader de swing trade de criptomoedas. Analise os dados de mercado e tome uma decisão de trading.
 
 Dados de Mercado:
 {market_state}
@@ -1051,17 +1060,17 @@ Portfólio Atual:
 
 Regras:
 - Apenas LONG (sem SHORT)
-- Máximo 1 posição(ões) por vez
-- Risco de 1.0% por trade
-- Capital de referência: R$ 100.0
+- Máximo ${maxPos} posição(ões) por vez
+- Risco de ${risk}% por trade
+- Capital de referência: R$ ${cap}
 - Stop loss obrigatório
 - Take profit obrigatório
-- Só opera se confiança >= 50.0%
-- Perda diária máxima: 5.0% do capital
-- Tamanho máximo de posição: 20.0% do capital
+- Só opera se confiança >= ${minConf}%
+- Perda diária máxima: ${dailyLoss}% do capital
+- Tamanho máximo de posição: ${posSize}% do capital
 
 Responda com JSON:
-{{
+{
     "action": "LONG" ou "HOLD" ou "CLOSE",
     "confidence": 0.0 a 1.0,
     "thesis": "raciocínio breve",
@@ -1069,8 +1078,12 @@ Responda com JSON:
     "stop_loss": número ou null,
     "take_profit": número ou null,
     "reasoning": "análise detalhada"
-}}`;
-            document.getElementById('trading-prompt').value = defaultPrompt;
+}`;
+                document.getElementById('trading-prompt').value = defaultPrompt;
+            }).catch(() => {
+                alert('Erro ao buscar configuração. Usando prompt mínimo.');
+                document.getElementById('trading-prompt').value = 'Você é um trader. Analise os dados e responda com JSON.';
+            });
         }
     </script>
 </body>

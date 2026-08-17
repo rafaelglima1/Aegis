@@ -60,12 +60,13 @@ class DashboardMetrics:
 
 @dataclass
 class DashboardRiskStatus:
-    """Risk status display."""
+    """Risk status display.
+    AC-C3-05: max_positions has no default — must come from config."""
 
     kill_switch_active: bool = False
     daily_pnl: Decimal = Decimal("0")
     daily_loss_limit: Decimal = Decimal("500.00")
-    max_positions: int = 5
+    max_positions: int = 0
     current_positions: int = 0
 
 
@@ -82,11 +83,11 @@ class DashboardConfig:
 class DashboardService:
     """AC-14.01-14.10: Dashboard displays operational data."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_positions: int = 0) -> None:
         self._positions: list[DashboardPosition] = []
         self._orders: list[DashboardOrder] = []
         self._metrics = DashboardMetrics()
-        self._risk_status = DashboardRiskStatus()
+        self._risk_status = DashboardRiskStatus(max_positions=max_positions)
         self._config = DashboardConfig()
 
     def get_environment(self) -> str:
