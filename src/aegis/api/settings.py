@@ -10,6 +10,38 @@ from pydantic import BaseModel, Field
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 SETTINGS_FILE = Path("/home/ubuntu/aegis/.env.prod")
+PROMPT_FILE = Path("/home/ubuntu/aegis/prompt_template.txt")
+
+DEFAULT_PROMPT = """\
+Você é um trader de swing trade de criptomoedas. Analise os dados de mercado e tome uma decisão de trading.
+
+Dados de Mercado:
+{market_state}
+
+Portfólio Atual:
+{portfolio}
+
+Regras:
+- Apenas LONG (sem SHORT)
+- Máximo 1 posição(ões) por vez
+- Risco de 1.0% por trade
+- Capital de referência: R$ 100.0
+- Stop loss obrigatório
+- Take profit obrigatório
+- Só opera se confiança >= 50.0%
+- Perda diária máxima: 5.0% do capital
+- Tamanho máximo de posição: 20.0% do capital
+
+Responda com JSON:
+{{
+    "action": "LONG" ou "HOLD" ou "CLOSE",
+    "confidence": 0.0 a 1.0,
+    "thesis": "raciocínio breve",
+    "entry_price": número ou null,
+    "stop_loss": número ou null,
+    "take_profit": número ou null,
+    "reasoning": "análise detalhada"
+}}"""
 
 
 class LLMSettings(BaseModel):
@@ -43,6 +75,7 @@ class TradingSettings(BaseModel):
     max_position_size_pct: float = Field(default=20.0, description="Max position size % of capital")
     max_exposure_pct: float = Field(default=100.0, description="Max total exposure % of capital")
     min_confidence: float = Field(default=0.5, description="Min AI confidence to trade (0-1)")
+    prompt_template: str = Field(default=DEFAULT_PROMPT, description="LLM prompt template")
 
 
 class AllSettings(BaseModel):
@@ -102,6 +135,7 @@ async def get_settings() -> AllSettings:
             max_position_size_pct=float(env.get("MAX_POSITION_SIZE_PCT", "20.0")),
             max_exposure_pct=float(env.get("MAX_EXPOSURE_PCT", "100.0")),
             min_confidence=float(env.get("MIN_CONFIDENCE", "0.5")),
+            prompt_template=_read_prompt(),
         ),
     )
 
@@ -150,6 +184,7 @@ async def update_trading(settings: TradingSettings) -> dict[str, str]:
     env["MAX_EXPOSURE_PCT"] = str(settings.max_exposure_pct)
     env["MIN_CONFIDENCE"] = str(settings.min_confidence)
     _write_env(env)
+    _write_prompt(settings.prompt_template)
     return {"status": "ok", "message": "Trading settings updated"}
 
 
@@ -157,3 +192,14 @@ def _mask(value: str) -> str:
     if not value or len(value) < 8:
         return "***"
     return value[:4] + "***" + value[-4:]
+
+
+def _read_prompt() -> str:
+    if PROMPT_FILE.exists():
+        return PROMPT_FILE.read_text(encoding="utf-8")
+    return DEFAULT_PROMPT
+
+
+def _write_prompt(template: str) -> None:
+    PROMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PROMPT_FILE.write_text(template, encoding="utf-8")

@@ -11,6 +11,7 @@ from aegis.domain.enums import OrderSide, OrderStatus
 from aegis.execution.broker import BrokerAdapter, OrderSubmission
 from aegis.execution.sandbox import SandboxBroker
 from aegis.execution.live import LiveBroker, LiveBrokerConfig
+from aegis.execution.mercadobitcoin import MercadoBitcoinBroker
 from aegis.execution.factory import create_broker
 
 
@@ -52,13 +53,13 @@ def test_factory_selects_sandbox() -> None:
 
 
 def test_factory_selects_live() -> None:
-    """AC-09.05: TRADING_ENVIRONMENT=LIVE selects LiveBroker."""
+    """AC-CORR-04: TRADING_ENVIRONMENT=LIVE selects MercadoBitcoinBroker."""
     settings = Settings(
         trading_environment=TradingEnvironment.LIVE,
         live_enabled=True,
     )
     broker = create_broker(settings)
-    assert isinstance(broker, LiveBroker)
+    assert isinstance(broker, MercadoBitcoinBroker)
 
 
 def test_factory_no_code_change() -> None:

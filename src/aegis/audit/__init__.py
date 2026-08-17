@@ -20,6 +20,7 @@ class AuditEventType(Enum):
     RISK = "RISK"
     ORDER = "ORDER"
     FILL = "FILL"
+    PORTFOLIO = "PORTFOLIO"
     SYSTEM = "SYSTEM"
     ERROR = "ERROR"
 
@@ -65,6 +66,27 @@ class AuditLogger:
                 "success": event.success,
             },
         )
+
+    def record_event(
+        self,
+        event_type: AuditEventType,
+        correlation_id: UUID,
+        data: dict[str, Any],
+        component: str = "",
+        action: str = "",
+        success: bool = True,
+    ) -> AuditEvent:
+        """Generic event recording — used by pipeline."""
+        event = AuditEvent(
+            correlation_id=correlation_id,
+            event_type=event_type,
+            component=component,
+            action=action,
+            data=data,
+            success=success,
+        )
+        self.record(event)
+        return event
 
     def record_decision(
         self,

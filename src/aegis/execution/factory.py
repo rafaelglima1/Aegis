@@ -1,30 +1,45 @@
-"""AEGIS Broker Factory — environment-driven broker selection."""
+"""AEGIS Broker Factory — environment-driven broker selection.
+
+AC-CORR-03: SANDBOX -> SandboxBroker
+AC-CORR-04: LIVE + LIVE_ENABLED=true -> MercadoBitcoinBroker
+AC-CORR-05: LIVE + LIVE_ENABLED=false -> RuntimeError (fail-closed)
+AC-CORR-08: Selection by configuration only, no code change required.
+"""
 
 from __future__ import annotations
-
-from typing import Union
 
 from aegis.config import Settings
 from aegis.execution.broker import BrokerAdapter
 from aegis.execution.sandbox import SandboxBroker
-from aegis.execution.live import LiveBroker, LiveBrokerConfig
+from aegis.execution.mercadobitcoin import MercadoBitcoinBroker, MercadoBitcoinConfig
 
 
-def create_broker(settings: Settings) -> BrokerAdapter:
-    """AC-09.04: TRADING_ENVIRONMENT=SANDBOX selects SandboxBroker.
-    AC-09.05: TRADING_ENVIRONMENT=LIVE selects LiveBroker.
-    AC-09.06: Changing environment requires no application-code modification."""
+def create_broker(settings: Settings | None = None) -> BrokerAdapter:
+    """Create the appropriate broker based on environment configuration.
+
+    SANDBOX -> SandboxBroker (paper trading)
+    LIVE + LIVE_ENABLED=true -> MercadoBitcoinBroker (real exchange)
+    LIVE + LIVE_ENABLED=false -> RuntimeError (fail-closed)
+    """
+    if settings is None:
+        from aegis.config import get_settings
+        settings = get_settings()
 
     if settings.trading_environment.value == "SANDBOX":
         return SandboxBroker()
 
     if settings.trading_environment.value == "LIVE":
         if not settings.live_enabled:
-            raise RuntimeError("LIVE trading is disabled (LIVE_ENABLED=false)")
+            raise RuntimeError(
+                "LIVE trading is disabled (LIVE_ENABLED=false). "
+                "Set LIVE_ENABLED=true to enable live execution."
+            )
 
-        config = LiveBrokerConfig(
+        config = MercadoBitcoinConfig(
+            api_key=settings.live_api_key,
+            api_secret=settings.live_api_secret,
             enabled=settings.live_enabled,
         )
-        return LiveBroker(config)
+        return MercadoBitcoinBroker(config)
 
     raise ValueError(f"Unknown trading environment: {settings.trading_environment}")

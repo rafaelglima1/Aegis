@@ -10,10 +10,10 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from aegis.ai_engine.decision_engine import DecisionContract
-from aegis.domain.enums import OrderSide, TradingAction
+from aegis.domain.enums import OrderSide, PositionSide, TradingAction
 from aegis.domain.contracts import utc_now
 from aegis.risk_engine.risk_engine import RiskEngine, RiskDecision
-from aegis.execution.sandbox import SandboxBroker
+from aegis.execution.broker import BrokerAdapter
 from aegis.execution.engine import ExecutionEngine
 from aegis.portfolio.portfolio import Portfolio
 from aegis.audit import AuditLogger, AuditEventType
@@ -51,12 +51,16 @@ class TradingPipeline:
     def __init__(
         self,
         risk_engine: RiskEngine | None = None,
-        broker: SandboxBroker | None = None,
+        broker: BrokerAdapter | None = None,
         portfolio: Portfolio | None = None,
         audit: AuditLogger | None = None,
     ) -> None:
         self._risk = risk_engine or RiskEngine()
-        self._broker = broker or SandboxBroker()
+        if broker is None:
+            from aegis.execution.factory import create_broker
+            from aegis.config import get_settings
+            broker = create_broker(get_settings())
+        self._broker = broker
         self._execution = ExecutionEngine(self._broker)
         self._portfolio = portfolio or Portfolio()
         self._audit = audit or AuditLogger()
@@ -156,8 +160,8 @@ class TradingPipeline:
                 # Step 4: Update portfolio
                 if order_result.fill_price:
                     self._portfolio.record_fill(
-                        symbol=symbol,
-                        side=OrderSide.BUY,
+                        asset=symbol,
+                        side=PositionSide.LONG,
                         quantity=risk_result.approved_quantity,
                         price=order_result.fill_price,
                     )

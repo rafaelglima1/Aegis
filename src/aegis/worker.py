@@ -8,6 +8,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -19,12 +20,25 @@ from aegis.ai_engine.prompt_manager import PromptManager, PromptVersion
 from aegis.domain.enums import TradingAction, PositionSide
 from aegis.risk_engine.risk_engine import RiskEngine
 from aegis.risk_engine.risk_limits import RiskLimits
-from aegis.execution.sandbox import SandboxBroker
 from aegis.execution.engine import ExecutionEngine
 from aegis.portfolio.portfolio import Portfolio
 from aegis.audit import AuditLogger
 
 logger = logging.getLogger("aegis.worker")
+
+_SETTINGS_FILE = Path("/home/ubuntu/aegis/.env.prod")
+_PROMPT_FILE = Path("/home/ubuntu/aegis/prompt_template.txt")
+
+
+def _read_env_file() -> dict[str, str]:
+    env: dict[str, str] = {}
+    if _SETTINGS_FILE.exists():
+        for line in _SETTINGS_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                env[key.strip()] = value.strip()
+    return env
 
 
 class MercadoBitcoinAPI:
@@ -315,12 +329,12 @@ class AutonomousWorker:
             max_position_size_pct=self.max_position_size_pct,
             max_exposure_pct=self.max_exposure_pct,
         ))
-        self.broker = SandboxBroker()
+        self.broker = self._create_broker()
         self.execution = ExecutionEngine(self.broker)
         self.portfolio = Portfolio()
         self.audit = AuditLogger()
 
-        # Register default prompt
+        # Register default prompt (will be rebuilt dynamically by _reload_config)
         self.prompt_manager.register(
             PromptVersion(
                 version="trading_v1",
@@ -332,14 +346,6 @@ Dados de Mercado:
 Portfólio Atual:
 {portfolio}
 
-Regras:
-- Apenas LONG (sem SHORT)
-- Apenas spot (sem alavancagem)
-- Máximo 1 posição por vez
-- Risco de 1% por trade
-- Stop loss e take profit obrigatórios
-- Só opera se confiança > 50%
-
 Responda com JSON:
 {{
     "action": "LONG" ou "HOLD" ou "CLOSE",
@@ -350,7 +356,7 @@ Responda com JSON:
     "take_profit": número ou null,
     "reasoning": "análise detalhada"
 }}""",
-                description="Default trading prompt for crypto swing trading",
+                description="Default trading prompt (overridden by _reload_config)",
             )
         )
 
@@ -384,6 +390,143 @@ Responda com JSON:
     @property
     def state(self) -> dict[str, Any]:
         return self._state.copy()
+
+    def _create_broker(self) -> Any:
+        """Create broker via factory based on environment configuration.
+
+        SANDBOX -> SandboxBroker
+        LIVE + LIVE_ENABLED=true -> MercadoBitcoinBroker
+        LIVE + LIVE_ENABLED=false -> RuntimeError
+        """
+        from aegis.execution.factory import create_broker
+        from aegis.config import Settings, TradingEnvironment
+
+        env = _read_env_file()
+        trading_env = env.get("TRADING_ENVIRONMENT", "SANDBOX")
+        live_enabled = env.get("LIVE_ENABLED", "false").lower() == "true"
+        live_api_key = env.get("MB_API_KEY", "")
+        live_api_secret = env.get("MB_API_SECRET", "")
+
+        settings = Settings(
+            trading_environment=TradingEnvironment(trading_env),
+            live_enabled=live_enabled,
+            live_api_key=live_api_key,
+            live_api_secret=live_api_secret,
+        )
+        return create_broker(settings)
+
+    def _reload_config(self) -> None:
+        """Re-read .env.prod and update all settings + risk engine."""
+        env = _read_env_file()
+        if not env:
+            return
+
+        # Update basic settings
+        self.symbols = env.get("TRADING_SYMBOLS", ",".join(self.symbols)).split(",")
+        self.timeframe = env.get("TRADING_TIMEFRAME", self.timeframe)
+        self.capital = Decimal(env.get("TRADING_CAPITAL", str(self.capital)))
+        self.risk_pct = Decimal(env.get("RISK_PER_TRADE_PCT", str(self.risk_pct * 100))) / Decimal("100")
+        self.max_positions = int(env.get("MAX_POSITIONS", str(self.max_positions)))
+        self.mandatory_stop = env.get("MANDATORY_STOP", str(self.mandatory_stop).lower()).lower() == "true"
+        self.mandatory_take_profit = env.get("MANDATORY_TAKE_PROFIT", str(self.mandatory_take_profit).lower()).lower() == "true"
+        self.long_only = env.get("LONG_ONLY", str(self.long_only).lower()).lower() == "true"
+        self.max_daily_loss_pct = Decimal(env.get("MAX_DAILY_LOSS_PCT", str(self.max_daily_loss_pct * 100))) / Decimal("100")
+        self.max_position_size_pct = Decimal(env.get("MAX_POSITION_SIZE_PCT", str(self.max_position_size_pct * 100))) / Decimal("100")
+        self.max_exposure_pct = Decimal(env.get("MAX_EXPOSURE_PCT", str(self.max_exposure_pct * 100))) / Decimal("100")
+        self.min_confidence = Decimal(env.get("MIN_CONFIDENCE", str(self.min_confidence)))
+        self.circuit_breaker_pct = Decimal(env.get("CIRCUIT_BREAKER_PCT", str(self.circuit_breaker_pct * 100))) / Decimal("100")
+
+        # Update risk engine limits
+        self.risk_engine.limits = RiskLimits(
+            reference_capital=self.capital,
+            max_risk_per_trade_pct=self.risk_pct,
+            max_simultaneous_positions=self.max_positions,
+            circuit_breaker_drawdown_pct=self.circuit_breaker_pct,
+            max_daily_loss_pct=self.max_daily_loss_pct,
+            max_position_size_pct=self.max_position_size_pct,
+            max_exposure_pct=self.max_exposure_pct,
+        )
+
+        # Update state
+        self._state["capital"] = str(self.capital)
+        self._state["risk_limits"] = {
+            "reference_capital": str(self.capital),
+            "max_risk_per_trade_pct": str(self.risk_pct * 100),
+            "max_positions": self.max_positions,
+            "circuit_breaker_pct": str(self.circuit_breaker_pct * 100),
+            "mandatory_stop": self.mandatory_stop,
+            "mandatory_take_profit": self.mandatory_take_profit,
+            "long_only": self.long_only,
+            "min_confidence": str(self.min_confidence),
+            "max_daily_loss_pct": str(self.max_daily_loss_pct * 100),
+            "max_position_size_pct": str(self.max_position_size_pct * 100),
+            "max_exposure_pct": str(self.max_exposure_pct * 100),
+        }
+
+        # Rebuild LLM prompt from file or fallback to dynamic
+        if _PROMPT_FILE.exists():
+            template = _PROMPT_FILE.read_text(encoding="utf-8")
+            logger.info("Loaded prompt from file (%d chars)", len(template))
+        else:
+            direction = "Apenas LONG (sem SHORT)" if self.long_only else "LONG e SHORT"
+            sl_tp_rules = []
+            if self.mandatory_stop:
+                sl_tp_rules.append("- Stop loss obrigatório")
+            else:
+                sl_tp_rules.append("- Stop loss opcional")
+            if self.mandatory_take_profit:
+                sl_tp_rules.append("- Take profit obrigatório")
+            else:
+                sl_tp_rules.append("- Take profit opcional")
+
+            _rules = "\n".join(sl_tp_rules)
+            _max_pos = self.max_positions
+            _risk = self.risk_pct * 100
+            _cap = self.capital
+            _conf = self.min_confidence * 100
+            _daily = self.max_daily_loss_pct * 100
+            _pos_sz = self.max_position_size_pct * 100
+
+            template = (
+                "Você é um trader de swing trade de criptomoedas. Analise os dados de mercado e tome uma decisão de trading.\n"
+                "\n"
+                "Dados de Mercado:\n"
+                "{market_state}\n"
+                "\n"
+                "Portfólio Atual:\n"
+                "{portfolio}\n"
+                "\n"
+                "Regras:\n"
+                f"- {direction}\n"
+                f"- Máximo {_max_pos} posição(ões) por vez\n"
+                f"- Risco de {_risk}% por trade\n"
+                f"- Capital de referência: R$ {_cap}\n"
+                f"{_rules}\n"
+                f"- Só opera se confiança >= {_conf}%\n"
+                f"- Perda diária máxima: {_daily}% do capital\n"
+                f"- Tamanho máximo de posição: {_pos_sz}% do capital\n"
+                "\n"
+                "Responda com JSON:\n"
+                "{{\n"
+                '    "action": "LONG" ou "HOLD" ou "CLOSE",\n'
+                '    "confidence": 0.0 a 1.0,\n'
+                '    "thesis": "raciocínio breve",\n'
+                '    "entry_price": número ou null,\n'
+                '    "stop_loss": número ou null,\n'
+                '    "take_profit": número ou null,\n'
+                '    "reasoning": "análise detalhada"\n'
+                "}}"
+            )
+
+        self.prompt_manager.register(
+            PromptVersion(
+                version="trading_v1",
+                template=template,
+                description="Dynamic trading prompt from config",
+            )
+        )
+        logger.info("Config reloaded: %d symbols, max_positions=%d, risk=%.1f%%",
+                     len(self.symbols), self.max_positions, self.risk_pct * 100)
 
     def add_ws_client(self, ws: Any) -> None:
         self._ws_clients.append(ws)
@@ -431,6 +574,9 @@ Responda com JSON:
     async def _tick(self) -> None:
         """Main trading loop tick."""
         logger.info("Starting tick...")
+
+        # Reload config from .env.prod (settings may have changed via dashboard)
+        self._reload_config()
 
         for symbol in self.symbols:
             try:

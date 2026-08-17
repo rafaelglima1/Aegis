@@ -125,6 +125,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <h1>AEGIS <span class="env" id="env-badge">SANDBOX</span></h1>
         <div style="display:flex;gap:8px;align-items:center">
             <span style="font-size:12px;color:#888" id="clock"></span>
+            <button class="btn" onclick="manualRun()" style="padding:6px 12px;font-size:12px">Executar Agora</button>
             <button class="btn" onclick="location.href='/'" style="padding:6px 12px;font-size:12px">Config</button>
         </div>
     </div>
@@ -177,7 +178,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- POSIÇÕES -->
         <div class="section" id="sec-positions">
             <div class="card">
-                <h2>Posições Abertas</h2>
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <h2>Posições Abertas</h2>
+                    <button class="btn" onclick="openExport('positions')">Exportar JSON</button>
+                </div>
                 <table class="positions-table">
                     <thead><tr><th>Par</th><th>Lado</th><th>Qtd</th><th>Preço Entrada</th><th>Preço Atual</th><th>P&L</th><th>Stop</th><th>Take Profit</th><th>Ações</th></tr></thead>
                     <tbody id="positions-body"><tr><td colspan="9" class="empty">Nenhuma posição aberta</td></tr></tbody>
@@ -223,7 +227,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="status" id="order-status"></div>
             </div>
             <div class="card">
-                <h2>Ordens Ativas</h2>
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <h2>Ordens Ativas</h2>
+                    <button class="btn" onclick="openExport('orders')">Exportar JSON</button>
+                </div>
                 <table class="orders-table">
                     <thead><tr><th>ID</th><th>Par</th><th>Lado</th><th>Qtd</th><th>Preço</th><th>Status</th><th>Timestamp</th></tr></thead>
                     <tbody id="orders-body"><tr><td colspan="7" class="empty">Nenhuma ordem ativa</td></tr></tbody>
@@ -236,7 +243,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="card">
                 <div style="display:flex;justify-content:space-between;align-items:center">
                     <h2>Histórico de Trades</h2>
-                    <button class="btn" onclick="openExportHistory()">Exportar JSON</button>
+                    <button class="btn" onclick="openExport('history')">Exportar JSON</button>
                 </div>
                 <table class="history-table">
                     <thead><tr><th>Data</th><th>Par</th><th>Lado</th><th>Qtd</th><th>Entrada</th><th>Saída</th><th>P&L</th><th>Fee</th></tr></thead>
@@ -248,7 +255,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- AI DECISIONS -->
         <div class="section" id="sec-ai">
             <div class="card">
-                <h2>Decisões da IA</h2>
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <h2>Decisões da IA</h2>
+                    <button class="btn" onclick="openExport('decisions')">Exportar JSON</button>
+                </div>
                 <div id="ai-decisions"><div class="empty">Nenhuma decisão registrada</div></div>
             </div>
         </div>
@@ -512,6 +522,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="status" id="live-status"></div>
             </div>
             <div class="card">
+                <h2>Prompt do LLM</h2>
+                <p style="font-size:12px;color:#666;margin-top:0;margin-bottom:8px">
+                    Template do prompt enviado ao modelo. Use <code>{market_state}</code> e <code>{portfolio}</code> como placeholders.
+                    Variáveis dinâmicas são substituídas pelo worker.
+                </p>
+                <div class="field">
+                    <textarea id="trading-prompt" rows="18" style="width:100%;padding:10px;border:1px solid #333;border-radius:4px;background:#0d0d1a;color:#fff;font-family:monospace;font-size:12px;resize:vertical;box-sizing:border-box"></textarea>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center">
+                    <button class="btn" onclick="saveTrading()">Salvar Prompt</button>
+                    <button class="btn secondary" onclick="resetPrompt()">Restaurar Padrão</button>
+                </div>
+                <div class="status" id="trading-status-4"></div>
+            </div>
+            <div class="card">
                 <div style="display:flex;justify-content:space-between;align-items:center">
                     <h2>Exportar Configuração</h2>
                     <button class="btn" onclick="exportConfig()">Exportar JSON (sem keys)</button>
@@ -521,10 +546,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- Export History Modal -->
-    <div class="modal-overlay" id="modal-export-history" style="display:none" onclick="closeModal('modal-export-history')">
+    <!-- Export Modal -->
+    <div class="modal-overlay" id="modal-export" style="display:none" onclick="closeModal('modal-export')">
         <div class="modal" onclick="event.stopPropagation()">
-            <h2>Exportar Histórico</h2>
+            <h2 id="export-modal-title">Exportar Dados</h2>
             <p style="color:#aaa;font-size:13px;margin-bottom:16px">Escolha como deseja filtrar os registros antes de exportar.</p>
             <div class="field">
                 <label>Modo de seleção</label>
@@ -551,8 +576,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 </div>
             </div>
             <div style="display:flex;gap:8px;margin-top:16px">
-                <button class="btn" onclick="doExportHistory()">Exportar</button>
-                <button class="btn secondary" onclick="closeModal('modal-export-history')">Cancelar</button>
+                <button class="btn" onclick="doExport()">Exportar</button>
+                <button class="btn secondary" onclick="closeModal('modal-export')">Cancelar</button>
             </div>
         </div>
     </div>
@@ -803,6 +828,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 document.getElementById('trading-max-pos-size').value = data.trading.max_position_size_pct;
                 document.getElementById('trading-max-exposure').value = data.trading.max_exposure_pct;
                 document.getElementById('trading-circuit-breaker').value = data.trading.circuit_breaker_pct;
+                document.getElementById('trading-prompt').value = data.trading.prompt_template;
                 // Badge
                 document.getElementById('env-badge').textContent = data.trading.trading_environment;
                 document.getElementById('env-badge').className = 'env' + (data.trading.trading_environment === 'LIVE' ? ' live' : '');
@@ -847,9 +873,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 max_position_size_pct: parseFloat(document.getElementById('trading-max-pos-size').value) || 20.0,
                 max_exposure_pct: parseFloat(document.getElementById('trading-max-exposure').value) || 100.0,
                 circuit_breaker_pct: parseFloat(document.getElementById('trading-circuit-breaker').value) || 10.0,
+                prompt_template: document.getElementById('trading-prompt').value || '',
             };
             await fetch('/api/settings/trading', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
-            ['trading-status', 'trading-status-2', 'trading-status-3'].forEach(id => {
+            ['trading-status', 'trading-status-2', 'trading-status-3', 'trading-status-4'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) { el.className = 'status ok'; el.textContent = 'Salvo com sucesso'; }
             });
@@ -874,6 +901,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         loadSettings();
         loadAll();
         setInterval(loadAll, 10000);
+
+        async function manualRun() {
+            const btn = event.target;
+            btn.disabled = true; btn.textContent = 'Executando...';
+            try {
+                const res = await fetch('/api/run', { method: 'POST' });
+                const data = await res.json();
+                btn.textContent = data.status === 'ok' ? 'Concluído!' : 'Erro';
+                setTimeout(() => { btn.disabled = false; btn.textContent = 'Executar Agora'; }, 2000);
+                loadAll();
+            } catch(e) {
+                btn.textContent = 'Erro';
+                setTimeout(() => { btn.disabled = false; btn.textContent = 'Executar Agora'; }, 2000);
+            }
+        }
 
         // WebSocket for real-time updates
         let ws;
@@ -909,6 +951,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         connectWS();
 
         // === EXPORT FUNCTIONS ===
+        let _exportSection = null;
 
         function downloadJSON(data, filename) {
             const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -919,8 +962,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.body.removeChild(a); URL.revokeObjectURL(url);
         }
 
-        function openExportHistory() {
-            document.getElementById('modal-export-history').style.display = 'flex';
+        const _exportTitles = {
+            positions: 'Exportar Posições',
+            orders: 'Exportar Ordens',
+            history: 'Exportar Histórico',
+            decisions: 'Exportar Decisões IA',
+        };
+
+        function openExport(section) {
+            _exportSection = section;
+            document.getElementById('export-modal-title').textContent = _exportTitles[section] || 'Exportar Dados';
+            document.getElementById('modal-export').style.display = 'flex';
             toggleExportMode();
         }
 
@@ -934,9 +986,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.getElementById('export-range-field').style.display = mode === 'range' ? 'block' : 'none';
         }
 
-        async function doExportHistory() {
+        async function doExport() {
             const mode = document.getElementById('export-mode').value;
-            let records = state.history || [];
+            let records = state[_exportSection] || [];
 
             if (mode === 'qty') {
                 const qty = parseInt(document.getElementById('export-qty').value) || records.length;
@@ -944,8 +996,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             } else if (mode === 'range') {
                 const from = document.getElementById('export-date-from').value;
                 const to = document.getElementById('export-date-to').value;
-                if (from) records = records.filter(r => r.date >= from);
-                if (to) records = records.filter(r => r.date <= to + 'T23:59:59');
+                if (from) records = records.filter(r => (r.date || r.timestamp || '') >= from);
+                if (to) records = records.filter(r => (r.date || r.timestamp || '') <= to + 'T23:59:59');
             }
 
             if (records.length === 0) {
@@ -955,22 +1007,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
             const exportData = {
                 exported_at: new Date().toISOString(),
+                section: _exportSection,
                 total_records: records.length,
-                filter: { mode },
-                trades: records.map(t => ({
-                    date: t.date,
-                    symbol: t.symbol,
-                    side: t.side,
-                    quantity: t.quantity,
-                    entry_price: t.entry_price,
-                    exit_price: t.exit_price,
-                    pnl: t.pnl,
-                    fee: t.fee,
-                }))
+                records: records,
             };
 
-            downloadJSON(exportData, `aegis_history_${new Date().toISOString().slice(0,10)}.json`);
-            closeModal('modal-export-history');
+            downloadJSON(exportData, `aegis_${_exportSection}_${new Date().toISOString().slice(0,10)}.json`);
+            closeModal('modal-export');
         }
 
         async function exportConfig() {
@@ -994,6 +1037,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             } catch(e) {
                 alert('Erro ao exportar configuração: ' + e.message);
             }
+        }
+
+        function resetPrompt() {
+            if (!confirm('Restaurar o prompt padrão? O prompt atual será perdido.')) return;
+            const defaultPrompt = `Você é um trader de swing trade de criptomoedas. Analise os dados de mercado e tome uma decisão de trading.
+
+Dados de Mercado:
+{market_state}
+
+Portfólio Atual:
+{portfolio}
+
+Regras:
+- Apenas LONG (sem SHORT)
+- Máximo 1 posição(ões) por vez
+- Risco de 1.0% por trade
+- Capital de referência: R$ 100.0
+- Stop loss obrigatório
+- Take profit obrigatório
+- Só opera se confiança >= 50.0%
+- Perda diária máxima: 5.0% do capital
+- Tamanho máximo de posição: 20.0% do capital
+
+Responda com JSON:
+{{
+    "action": "LONG" ou "HOLD" ou "CLOSE",
+    "confidence": 0.0 a 1.0,
+    "thesis": "raciocínio breve",
+    "entry_price": número ou null,
+    "stop_loss": número ou null,
+    "take_profit": número ou null,
+    "reasoning": "análise detalhada"
+}}`;
+            document.getElementById('trading-prompt').value = defaultPrompt;
         }
     </script>
 </body>
@@ -1061,6 +1138,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from aegis.worker import get_worker
         worker = get_worker()
         return worker.state
+
+    @app.post("/api/run")
+    async def manual_run() -> dict[str, str]:
+        """Trigger a manual tick immediately."""
+        from aegis.worker import get_worker
+        worker = get_worker()
+        import asyncio as _aio
+        _aio.create_task(worker._tick())
+        return {"status": "ok", "message": "Tick executado manualmente"}
 
     @app.post("/api/trade")
     async def place_trade(request: TradeRequest) -> dict[str, Any]:

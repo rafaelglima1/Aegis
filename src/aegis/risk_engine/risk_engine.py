@@ -67,6 +67,10 @@ class RiskEngine:
     def limits(self) -> RiskLimits:
         return self._limits
 
+    @limits.setter
+    def limits(self, value: RiskLimits) -> None:
+        self._limits = value
+
     def activate_kill_switch(self) -> None:
         """AC-06.07: Kill switch blocks new orders."""
         self._kill_switch_active = True

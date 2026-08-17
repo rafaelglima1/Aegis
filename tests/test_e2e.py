@@ -19,6 +19,7 @@ from aegis.audit import AuditLogger, AuditEventType
 from aegis.config import Settings, TradingEnvironment
 from aegis.execution.factory import create_broker
 from aegis.execution.live import LiveBroker, LiveBrokerConfig
+from aegis.execution.mercadobitcoin import MercadoBitcoinBroker
 from aegis.ai_engine.decision_engine import DecisionContract
 
 
@@ -233,7 +234,7 @@ def test_environment_switching_no_code_change() -> None:
     broker_sandbox = create_broker(settings_sandbox)
     broker_live = create_broker(settings_live)
     assert isinstance(broker_sandbox, SandboxBroker)
-    assert isinstance(broker_live, LiveBroker)
+    assert isinstance(broker_live, MercadoBitcoinBroker)
 
 
 def test_live_blocked_when_disabled() -> None:

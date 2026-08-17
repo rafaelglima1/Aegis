@@ -26,6 +26,7 @@ from aegis.execution.broker import BrokerAdapter
 from aegis.execution.sandbox import SandboxBroker
 from aegis.execution.engine import ExecutionEngine
 from aegis.execution.live import LiveBroker, LiveBrokerConfig
+from aegis.execution.mercadobitcoin import MercadoBitcoinBroker
 from aegis.execution.factory import create_broker
 from aegis.execution.orchestrator import ExecutionOrchestrator
 from aegis.replay import ReplayEngine, ReplayDataset, ReplayState, Candle as ReplayCandle
@@ -328,7 +329,7 @@ def test_environment_switching_certified() -> None:
     broker_sandbox = create_broker(settings_sandbox)
     broker_live = create_broker(settings_live)
     assert isinstance(broker_sandbox, SandboxBroker)
-    assert isinstance(broker_live, LiveBroker)
+    assert isinstance(broker_live, MercadoBitcoinBroker)
 
 
 # === AC-16.16: Audit trail integrity and reconstruction proven ===
