@@ -47,8 +47,9 @@ class SandboxBroker(BrokerAdapter):
         return self._balance
 
     async def submit_order(self, submission: OrderSubmission) -> OrderResult:
-        """AC-08.03: Order submission works in Sandbox."""
-        """AC-08.07: Idempotency prevents duplicate orders."""
+        """AC-08.03: Order submission works in Sandbox.
+        AC-08.07: Idempotency prevents duplicate orders.
+        C6-04: SELL validates position exists, correct slippage direction."""
         if submission.idempotency_key in self._idempotency_keys:
             existing = self._orders.get(submission.order_id)
             if existing:
@@ -66,9 +67,47 @@ class SandboxBroker(BrokerAdapter):
             )
 
         self._idempotency_keys.add(submission.idempotency_key)
+        fee = Decimal("0.50")
 
-        required_cost = submission.price * submission.quantity
-        if self._balance < required_cost:
+        if submission.side == OrderSide.SELL:
+            # C6-04: Validate position exists and quantity is sufficient
+            position = await self.get_position(submission.symbol)
+            available_qty = position.get("quantity", Decimal("0"))
+            if available_qty <= 0:
+                self._orders[submission.order_id] = SandboxOrder(
+                    order_id=submission.order_id,
+                    idempotency_key=submission.idempotency_key,
+                    symbol=submission.symbol,
+                    side=submission.side,
+                    quantity=submission.quantity,
+                    price=submission.price,
+                    status=OrderStatus.REJECTED,
+                )
+                return OrderResult(
+                    order_id=submission.order_id,
+                    status=OrderStatus.REJECTED,
+                    error="No position to sell",
+                )
+            if submission.quantity > available_qty:
+                self._orders[submission.order_id] = SandboxOrder(
+                    order_id=submission.order_id,
+                    idempotency_key=submission.idempotency_key,
+                    symbol=submission.symbol,
+                    side=submission.side,
+                    quantity=submission.quantity,
+                    price=submission.price,
+                    status=OrderStatus.REJECTED,
+                )
+                return OrderResult(
+                    order_id=submission.order_id,
+                    status=OrderStatus.REJECTED,
+                    error=f"Sell quantity {submission.quantity} exceeds position {available_qty}",
+                )
+
+            # C6-04: SELL slippage is unfavorable to seller (fill_price < price)
+            slippage = submission.price * self._slippage_bps
+            fill_price = submission.price - slippage
+
             order = SandboxOrder(
                 order_id=submission.order_id,
                 idempotency_key=submission.idempotency_key,
@@ -76,40 +115,68 @@ class SandboxBroker(BrokerAdapter):
                 side=submission.side,
                 quantity=submission.quantity,
                 price=submission.price,
-                status=OrderStatus.REJECTED,
+                status=OrderStatus.FILLED,
+                fill_price=fill_price,
+                fill_quantity=submission.quantity,
+                fee=fee,
             )
             self._orders[submission.order_id] = order
+            # C6-04: SELL adds proceeds to balance (minus fee)
+            self._balance += fill_price * submission.quantity - fee
+
             return OrderResult(
                 order_id=submission.order_id,
-                status=OrderStatus.REJECTED,
-                error="Insufficient balance",
+                status=OrderStatus.FILLED,
+                fill_price=fill_price,
+                fill_quantity=submission.quantity,
+                fee=fee,
             )
+        else:
+            # BUY: existing behavior
+            required_cost = submission.price * submission.quantity
+            if self._balance < required_cost:
+                order = SandboxOrder(
+                    order_id=submission.order_id,
+                    idempotency_key=submission.idempotency_key,
+                    symbol=submission.symbol,
+                    side=submission.side,
+                    quantity=submission.quantity,
+                    price=submission.price,
+                    status=OrderStatus.REJECTED,
+                )
+                self._orders[submission.order_id] = order
+                return OrderResult(
+                    order_id=submission.order_id,
+                    status=OrderStatus.REJECTED,
+                    error="Insufficient balance",
+                )
 
-        slippage = submission.price * self._slippage_bps
-        fill_price = submission.price + slippage
+            # C6-04: BUY slippage is unfavorable to buyer (fill_price > price)
+            slippage = submission.price * self._slippage_bps
+            fill_price = submission.price + slippage
 
-        order = SandboxOrder(
-            order_id=submission.order_id,
-            idempotency_key=submission.idempotency_key,
-            symbol=submission.symbol,
-            side=submission.side,
-            quantity=submission.quantity,
-            price=submission.price,
-            status=OrderStatus.FILLED,
-            fill_price=fill_price,
-            fill_quantity=submission.quantity,
-            fee=Decimal("0.50"),
-        )
-        self._orders[submission.order_id] = order
-        self._balance -= required_cost + order.fee
+            order = SandboxOrder(
+                order_id=submission.order_id,
+                idempotency_key=submission.idempotency_key,
+                symbol=submission.symbol,
+                side=submission.side,
+                quantity=submission.quantity,
+                price=submission.price,
+                status=OrderStatus.FILLED,
+                fill_price=fill_price,
+                fill_quantity=submission.quantity,
+                fee=fee,
+            )
+            self._orders[submission.order_id] = order
+            self._balance -= required_cost + fee
 
-        return OrderResult(
-            order_id=submission.order_id,
-            status=OrderStatus.FILLED,
-            fill_price=fill_price,
-            fill_quantity=submission.quantity,
-            fee=order.fee,
-        )
+            return OrderResult(
+                order_id=submission.order_id,
+                status=OrderStatus.FILLED,
+                fill_price=fill_price,
+                fill_quantity=submission.quantity,
+                fee=fee,
+            )
 
     async def cancel_order(self, order_id: UUID, idempotency_key: UUID) -> CancelResult:
         """AC-08.04: Order cancellation works in Sandbox."""
@@ -149,10 +216,17 @@ class SandboxBroker(BrokerAdapter):
         )
 
     async def get_position(self, symbol: str) -> dict[str, Any]:
-        """Get current position for a symbol."""
+        """Get current net position for a symbol.
+        C6-04: BUY adds, SELL subtracts."""
         filled = [
             o for o in self._orders.values()
             if o.symbol == symbol and o.status == OrderStatus.FILLED
         ]
-        total_qty = sum((o.fill_quantity or Decimal("0") for o in filled), Decimal("0"))
-        return {"symbol": symbol, "quantity": total_qty, "orders": len(filled)}
+        total_qty = Decimal("0")
+        for o in filled:
+            qty = o.fill_quantity or Decimal("0")
+            if o.side == OrderSide.BUY:
+                total_qty += qty
+            else:
+                total_qty -= qty
+        return {"symbol": symbol, "quantity": max(total_qty, Decimal("0")), "orders": len(filled)}

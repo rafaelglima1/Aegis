@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 from aegis.domain.contracts import utc_now
 from aegis.domain.enums import OrderSide, OrderStatus
+from aegis.risk_engine.risk_limits import RiskLimits
 
 
 class ReplayState(Enum):
@@ -76,11 +77,12 @@ class ReplayEngine:
     AC-11.04: Look-ahead is impossible or explicitly detected.
     AC-C3-06: Replay accepts configurable initial capital."""
 
-    def __init__(self, initial_capital: Decimal = Decimal("100.00")) -> None:
+    def __init__(self, initial_capital: Decimal = Decimal("100.00"), risk_limits: RiskLimits | None = None) -> None:
         self._datasets: dict[UUID, ReplayDataset] = {}
         self._results: dict[UUID, ReplayResult] = {}
         self._audit_log: list[dict[str, Any]] = []
         self._initial_capital = initial_capital
+        self._risk_limits = risk_limits
 
     def register_dataset(self, dataset: ReplayDataset) -> UUID:
         """AC-11.01: Replay accepts a versioned dataset."""
@@ -128,7 +130,7 @@ class ReplayEngine:
         from aegis.risk_engine.risk_engine import RiskEngine
         from aegis.ai_engine.decision_engine import DecisionContract
         from aegis.domain.enums import TradingAction, OrderSide
-        risk_engine = RiskEngine()
+        risk_engine = RiskEngine(self._risk_limits) if self._risk_limits else RiskEngine()
 
         for i, candle in enumerate(dataset.candles):
             event = ReplayEvent(

@@ -38,7 +38,7 @@ Regras:
 - Capital de referência: R$ {capital}
 - Stop loss obrigatório
 - Take profit obrigatório
-- Só opera se confiança >= {min_confidence}%
+- Só opera se confiança >= {min_confidence * 100:.0f}%
 - Perda diária máxima: {max_daily_loss_pct}% do capital
 - Tamanho máximo de posição: {max_position_size_pct}% do capital
 

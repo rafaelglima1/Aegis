@@ -175,6 +175,7 @@ class TradingPipeline:
                         "side": "LONG",
                         "quantity": str(risk_result.approved_quantity),
                         "entry_price": str(order_result.fill_price),
+                        "current_price": str(order_result.fill_price),
                         "stop_loss": str(decision.stop_loss) if decision.stop_loss else None,
                         "take_profit": str(decision.take_profit) if decision.take_profit else None,
                         "status": "OPEN",
@@ -209,6 +210,10 @@ class TradingPipeline:
 
                     # Update risk engine state
                     self._risk.record_position_open()
+
+                    # Update capital from Portfolio (single source of truth)
+                    self._state["capital"] = str(self._portfolio.cash)
+                    self._state["pnl"] = str(self._portfolio.total_realized_pnl)
 
                     # Step 5: Audit portfolio update
                     self._audit.record_event(
@@ -245,8 +250,14 @@ class TradingPipeline:
 
         return result
 
-    async def close_position(self, position_id: str) -> PipelineResult:
-        """Close an existing position."""
+    async def close_position(self, position_id: str, price: Decimal | None = None) -> PipelineResult:
+        """Close an existing position.
+
+        Args:
+            position_id: Position to close
+            price: Optional exit price override. If None, uses position's current_price.
+                   If current_price is not set, falls back to entry_price.
+        """
         result = PipelineResult(symbol="", status="PENDING")
 
         # Find position
@@ -273,18 +284,20 @@ class TradingPipeline:
             risk_decision = self._risk.evaluate(decision)
 
             # Execute close
+            exit_price = price or Decimal(position.get("current_price", position["entry_price"]))
             order_result = await self._execution.execute_order(
                 order_id=uuid4(),
                 idempotency_key=uuid4(),
                 symbol=position["symbol"],
                 side=OrderSide.SELL,
                 quantity=Decimal(position["quantity"]),
-                price=Decimal(position["entry_price"]),
+                price=exit_price,
                 correlation_id=decision.correlation_id,
                 risk_decision=risk_decision,
             )
 
             # Update portfolio
+            pnl = Decimal("0")
             if order_result.fill_price:
                 pnl = self._portfolio.close_position(
                     asset=position["symbol"],
@@ -305,9 +318,9 @@ class TradingPipeline:
                 }
                 self._state["history"].append(trade)
 
-                # Update capital — keep as Decimal strings
-                self._state["capital"] = str(Decimal(self._state["capital"]) + pnl)
-                self._state["pnl"] = str(Decimal(self._state.get("pnl", "0")) + pnl)
+                # Update capital from Portfolio (single source of truth)
+                self._state["capital"] = str(self._portfolio.cash)
+                self._state["pnl"] = str(self._portfolio.total_realized_pnl)
 
                 # Update risk engine
                 self._risk.record_position_close()

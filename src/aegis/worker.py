@@ -393,6 +393,93 @@ Responda com JSON:
     def state(self) -> dict[str, Any]:
         return self._state.copy()
 
+    def close_position_manual(self, position_id: str) -> dict[str, Any]:
+        """Close a position manually from the dashboard API.
+
+        Routes through RiskEngine.evaluate() then Portfolio.close_position().
+        Returns dict with status, realized P&L, and errors.
+
+        Pre-existing positions must have current_price stored from the last tick.
+        """
+        from aegis.ai_engine.decision_engine import DecisionContract
+        from aegis.domain.enums import TradingAction
+
+        # Find position by ID
+        target = None
+        for pos in self._state["positions"]:
+            if pos.get("id") == position_id and pos.get("status") == "OPEN":
+                target = pos
+                break
+
+        if target is None:
+            return {"status": "NOT_FOUND", "error": f"Position {position_id} not found"}
+
+        symbol = target["symbol"]
+
+        # C6-03: CLOSE must pass through RiskEngine.evaluate() first
+        close_decision = DecisionContract(
+            action=TradingAction.CLOSE,
+            confidence=Decimal("1.0"),
+            thesis=f"Manual CLOSE for {symbol}",
+        )
+        close_risk = self.risk_engine.evaluate(close_decision)
+        if not close_risk.is_approved:
+            return {"status": "REJECTED", "error": "Risk rejected CLOSE", "violations": [v.code for v in close_risk.violations]}
+
+        entry_price = Decimal(target["entry_price"])
+        qty = Decimal(target["quantity"])
+        current_price = Decimal(target.get("current_price", target["entry_price"]))
+        entry_fee = Decimal(target.get("entry_fee", "0"))
+
+        # AC-C3-01/02: Exit fee from broker config — use same rate as autonomous CLOSE
+        exit_fee = Decimal("0.50")
+
+        # Route through Portfolio (single source of truth)
+        realized = self.portfolio.close_position(
+            asset=symbol,
+            price=current_price,
+            fee=exit_fee,
+        )
+
+        target["status"] = "CLOSED"
+
+        # Update state from Portfolio (single source of truth)
+        self._state["capital"] = str(self.portfolio.cash)
+        self._state["pnl"] = str(self.portfolio.total_realized_pnl)
+
+        # Add to history
+        trade = {
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "symbol": symbol,
+            "side": "LONG",
+            "quantity": target["quantity"],
+            "entry_price": target["entry_price"],
+            "exit_price": str(current_price),
+            "pnl": str(realized),
+            "fee": str(exit_fee),
+        }
+        self._state["history"].append(trade)
+
+        # Update risk engine
+        self.risk_engine.record_position_close()
+        self.risk_engine.record_daily_pnl(realized)
+
+        # Persist
+        self._save_state()
+
+        logger.info(
+            "Manual close: %s, realized: R$ %s, capital: R$ %s",
+            symbol,
+            realized,
+            self.portfolio.cash,
+        )
+
+        return {
+            "status": "CLOSED",
+            "pnl": str(realized),
+            "capital": str(self.portfolio.cash),
+        }
+
     def _create_broker(self) -> Any:
         """Create broker via factory based on environment configuration.
 
@@ -419,9 +506,13 @@ Responda com JSON:
 
     def _save_state(self) -> None:
         """Persist worker state to JSON file for restart recovery.
-        AC-FIN-12: Positions survive restart."""
+        AC-FIN-12: Positions survive restart.
+        AC-C5-03: Portfolio financial state persists across restart."""
         try:
             state_to_save = {
+                "capital": str(self.portfolio.cash),
+                "pnl": str(self.portfolio.total_realized_pnl),
+                "total_fees": str(self.portfolio.total_fees),
                 "positions": self._state["positions"],
                 "orders": self._state["orders"],
                 "history": self._state["history"],
@@ -432,9 +523,10 @@ Responda com JSON:
             logger.error("Failed to save state: %s", e)
 
     def _load_state(self) -> None:
-        """Load persisted state and reconstruct Risk Engine.
+        """Load persisted state and reconstruct Risk Engine + Portfolio.
         AC-FIN-12: Risk Engine reconstructs positions after restart.
-        AC-FIN-13: Restart does not artificially zero positions_count."""
+        AC-FIN-13: Restart does not artificially zero positions_count.
+        AC-C5-03: Portfolio reconstructed from persisted financial state."""
         if not _STATE_FILE.exists():
             logger.info("No persisted state found, starting fresh")
             return
@@ -446,17 +538,49 @@ Responda com JSON:
             self._state["history"] = saved.get("history", [])
             self._state["decisions"] = saved.get("decisions", [])
 
+            # AC-C5-03: Reconstruct Portfolio from persisted financial state
+            saved_capital = Decimal(saved.get("capital", str(self.capital)))
+            saved_pnl = Decimal(saved.get("pnl", "0"))
+            saved_fees = Decimal(saved.get("total_fees", "0"))
+
+            self.portfolio._cash = saved_capital
+            self.portfolio._total_realized_pnl = saved_pnl
+            self.portfolio._total_fees = saved_fees
+
+            # Reconstruct Portfolio position entries from OPEN positions
+            for pos in self._state["positions"]:
+                if pos.get("status") == "OPEN":
+                    from aegis.domain.enums import PositionSide, PositionStatus
+                    from aegis.portfolio.portfolio import PositionEntry
+                    symbol = pos["symbol"]
+                    entry = PositionEntry(
+                        asset=symbol,
+                        side=PositionSide.LONG,
+                        status=PositionStatus.OPEN,
+                        quantity=Decimal(pos.get("quantity", "0")),
+                        average_entry=Decimal(pos.get("entry_price", "0")),
+                        current_price=Decimal(pos.get("current_price", pos.get("entry_price", "0"))),
+                        entry_fee=Decimal(pos.get("entry_fee", "0")),
+                    )
+                    self.portfolio._positions[symbol] = entry
+
+            # Sync state from Portfolio
+            self._state["capital"] = str(self.portfolio.cash)
+            self._state["pnl"] = str(self.portfolio.total_realized_pnl)
+
             # Reconstruct Risk Engine state from persisted OPEN positions
             open_count = sum(1 for p in self._state["positions"] if p.get("status") == "OPEN")
             total_exposure = sum(
-                Decimal(p.get("quantity", "0")) * Decimal(p.get("entry_price", "0"))
+                Decimal(p.get("quantity", "0")) * Decimal(p.get("current_price", p.get("entry_price", "0")))
                 for p in self._state["positions"]
                 if p.get("status") == "OPEN"
             )
             self.risk_engine.rebuild_from_open_positions(open_count, total_exposure)
             logger.info(
-                "State restored: %d open positions, exposure R$ %s",
+                "State restored: %d open positions, capital R$ %s, P&L R$ %s, exposure R$ %s",
                 open_count,
+                self.portfolio.cash,
+                self.portfolio.total_realized_pnl,
                 total_exposure,
             )
         except Exception as e:
@@ -494,8 +618,9 @@ Responda com JSON:
             max_exposure_pct=self.max_exposure_pct,
         )
 
-        # Update state
-        self._state["capital"] = str(self.capital)
+        # Update state from Portfolio (single source of truth, not config)
+        self._state["capital"] = str(self.portfolio.cash)
+        self._state["pnl"] = str(self.portfolio.total_realized_pnl)
         self._state["risk_limits"] = {
             "reference_capital": str(self.capital),
             "max_risk_per_trade_pct": str(self.risk_pct * 100),
@@ -636,6 +761,13 @@ Responda com JSON:
         # Update current_price and P&L for all open positions
         self._update_positions_pnl()
 
+        # C6-02/C6-02B/C6-02C: Sync RiskEngine and state from Portfolio (source of truth)
+        self.risk_engine.update_equity(self.portfolio.equity)
+        self._state["capital"] = str(self.portfolio.cash)
+        self._state["pnl"] = str(self.portfolio.total_realized_pnl)
+        self._state["exposure"] = str(self.portfolio.exposure)
+        self._state["peak_equity"] = str(self.portfolio._peak_equity)
+
         # AC-FIN-12: Persist state for restart recovery
         self._save_state()
 
@@ -643,16 +775,27 @@ Responda com JSON:
         await self._broadcast({"type": "state_update", **self._state})
 
     def _update_positions_pnl(self) -> None:
-        """Update P&L for all open positions based on stored current_price."""
+        """C6-05: Sync P&L from Portfolio (source of truth) to state dict."""
         for pos in self._state["positions"]:
             if pos["status"] != "OPEN":
                 continue
+            symbol = pos["symbol"]
             entry = Decimal(pos["entry_price"])
-            current = Decimal(pos["current_price"])
             qty = Decimal(pos["quantity"])
-            pnl = (current - entry) * qty
-            pos["pnl"] = str(pnl)
-            pos["pnl_pct"] = str((pnl / (entry * qty) * 100) if entry > 0 and qty > 0 else 0)
+            # C6-01: Read current_price from Portfolio if available
+            portfolio_pos = self.portfolio._positions.get(symbol)
+            if portfolio_pos and portfolio_pos.quantity > 0:
+                current = portfolio_pos.current_price
+                pos["current_price"] = str(current)
+            else:
+                current = Decimal(pos["current_price"])
+            # C6-05: Read unrealized_pnl from Portfolio
+            if portfolio_pos:
+                unrealized = portfolio_pos.unrealized_pnl
+            else:
+                unrealized = (current - entry) * qty
+            pos["pnl"] = str(unrealized)
+            pos["pnl_pct"] = str((unrealized / (entry * qty) * 100) if entry > 0 and qty > 0 else 0)
 
     async def _process_symbol(self, symbol: str) -> None:
         """Process a single trading symbol."""
@@ -672,7 +815,11 @@ Responda com JSON:
             logger.warning("Invalid price for %s: %s", symbol, current_price)
             return
 
-        # Update current_price for open positions of this symbol
+        # C6-01: Update Portfolio with real market price (Portfolio is source of truth)
+        if symbol in self.portfolio._positions and self.portfolio._positions[symbol].quantity > 0:
+            self.portfolio.update_prices({symbol: current_price})
+
+        # Sync current_price from Portfolio to state (UI/API representation)
         for pos in self._state["positions"]:
             if pos["symbol"] == symbol and pos["status"] == "OPEN":
                 pos["current_price"] = str(current_price)
@@ -775,6 +922,7 @@ Responda com JSON:
                     "quantity": str(risk_result.approved_quantity),
                     "entry_price": str(entry),
                     "current_price": str(current_price),
+                    "entry_fee": str(order_result.fee),
                     "pnl": str(pnl),
                     "pnl_pct": str((pnl / (entry * risk_result.approved_quantity) * 100) if entry > 0 else 0),
                     "stop_loss": str(decision.stop_loss) if decision.stop_loss else None,
@@ -799,6 +947,10 @@ Responda com JSON:
                 # Update risk engine
                 self.risk_engine.record_position_open()
 
+                # Update capital from Portfolio (single source of truth)
+                self._state["capital"] = str(self.portfolio.cash)
+                self._state["pnl"] = str(self.portfolio.total_realized_pnl)
+
                 logger.info(
                     "Order filled: %s %s @ R$ %s",
                     risk_result.approved_quantity,
@@ -809,6 +961,21 @@ Responda com JSON:
         elif decision.action == TradingAction.CLOSE:
             # AC-C3-01: CLOSE routes through Portfolio.close_position()
             # AC-C3-02: Fee comes from broker config, not hardcoded zero
+            # C6-03: CLOSE must pass through RiskEngine.evaluate() first
+            close_decision = DecisionContract(
+                action=TradingAction.CLOSE,
+                confidence=Decimal("1.0"),
+                thesis=f"Autonomous CLOSE for {symbol}",
+            )
+            close_risk = self.risk_engine.evaluate(close_decision)
+            if not close_risk.is_approved:
+                logger.warning(
+                    "Risk rejected CLOSE for %s: %s",
+                    symbol,
+                    [v.code for v in close_risk.violations],
+                )
+                return
+
             for pos in self._state["positions"]:
                 if pos["symbol"] == symbol and pos["status"] == "OPEN":
                     entry = Decimal(pos["entry_price"])

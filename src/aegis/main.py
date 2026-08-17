@@ -1210,31 +1210,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/position/{position_id}/close")
     async def close_position(position_id: str) -> dict[str, str]:
-        """Close a position through the canonical pipeline.
+        """Close a position through the worker (canonical source of truth).
 
         AC-ARCH-2: Frontend never calls broker directly.
-        Frontend → TradingPipeline → ExecutionEngine → Broker.
+        Frontend → Worker.close_position_manual → Portfolio.close_position.
         """
-        from aegis.pipeline import TradingPipeline
-
-        pipeline = TradingPipeline()
-        result = await pipeline.close_position(position_id)
-
-        if result.status == "NOT_FOUND":
-            return {"status": "error", "error": result.errors[0] if result.errors else "Position not found"}
-        if result.status == "ERROR":
-            return {"status": "error", "error": "; ".join(result.errors)}
-
-        # Sync worker state
         from aegis.worker import get_worker
         worker = get_worker()
-        for pos in pipeline.state["positions"]:
-            worker_pos = next((p for p in worker._state["positions"] if p.get("id") == pos["id"]), None)
-            if worker_pos:
-                worker_pos["status"] = pos["status"]
+
+        result = worker.close_position_manual(position_id)
+
+        if result["status"] == "NOT_FOUND":
+            return {"status": "error", "error": result["error"]}
+        if result["status"] == "ERROR":
+            return {"status": "error", "error": result.get("error", "Close failed")}
 
         await broadcast({"type": "position_closed", "position_id": position_id})
-        return {"status": "ok", "message": "Position closed"}
+        return {"status": "ok", "message": "Position closed", "pnl": result["pnl"]}
 
     @app.post("/api/risk/kill-switch")
     async def toggle_kill_switch(request: KillSwitchRequest) -> dict[str, str]:

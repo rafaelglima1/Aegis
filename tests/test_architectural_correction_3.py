@@ -298,7 +298,7 @@ class TestFallbackPromptSemHardcodes:
         assert "2.0% por trade" in prompt
         assert "3.0% do capital" in prompt
         assert "15.0% do capital" in prompt
-        assert "confian\u00e7a >= 0.7%" in prompt
+        assert "confian\u00e7a >= 70%" in prompt
         assert "M\u00e1ximo 3" in prompt
 
 
