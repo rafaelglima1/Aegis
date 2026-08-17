@@ -28,6 +28,7 @@ logger = logging.getLogger("aegis.worker")
 
 _SETTINGS_FILE = Path("/home/ubuntu/aegis/.env.prod")
 _PROMPT_FILE = Path("/home/ubuntu/aegis/prompt_template.txt")
+_STATE_FILE = Path("/home/ubuntu/aegis/worker_state.json")
 
 
 def _read_env_file() -> dict[str, str]:
@@ -331,7 +332,8 @@ class AutonomousWorker:
         ))
         self.broker = self._create_broker()
         self.execution = ExecutionEngine(self.broker)
-        self.portfolio = Portfolio()
+        # AC-FIN-02: Portfolio starts with configured capital
+        self.portfolio = Portfolio(initial_cash=self.capital)
         self.audit = AuditLogger()
 
         # Register default prompt (will be rebuilt dynamically by _reload_config)
@@ -414,6 +416,51 @@ Responda com JSON:
             live_api_secret=live_api_secret,
         )
         return create_broker(settings)
+
+    def _save_state(self) -> None:
+        """Persist worker state to JSON file for restart recovery.
+        AC-FIN-12: Positions survive restart."""
+        try:
+            state_to_save = {
+                "positions": self._state["positions"],
+                "orders": self._state["orders"],
+                "history": self._state["history"],
+                "decisions": self._state["decisions"][-50:],
+            }
+            _STATE_FILE.write_text(json.dumps(state_to_save, default=str), encoding="utf-8")
+        except Exception as e:
+            logger.error("Failed to save state: %s", e)
+
+    def _load_state(self) -> None:
+        """Load persisted state and reconstruct Risk Engine.
+        AC-FIN-12: Risk Engine reconstructs positions after restart.
+        AC-FIN-13: Restart does not artificially zero positions_count."""
+        if not _STATE_FILE.exists():
+            logger.info("No persisted state found, starting fresh")
+            return
+
+        try:
+            saved = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+            self._state["positions"] = saved.get("positions", [])
+            self._state["orders"] = saved.get("orders", [])
+            self._state["history"] = saved.get("history", [])
+            self._state["decisions"] = saved.get("decisions", [])
+
+            # Reconstruct Risk Engine state from persisted OPEN positions
+            open_count = sum(1 for p in self._state["positions"] if p.get("status") == "OPEN")
+            total_exposure = sum(
+                Decimal(p.get("quantity", "0")) * Decimal(p.get("entry_price", "0"))
+                for p in self._state["positions"]
+                if p.get("status") == "OPEN"
+            )
+            self.risk_engine.rebuild_from_open_positions(open_count, total_exposure)
+            logger.info(
+                "State restored: %d open positions, exposure R$ %s",
+                open_count,
+                total_exposure,
+            )
+        except Exception as e:
+            logger.error("Failed to load state: %s", e)
 
     def _reload_config(self) -> None:
         """Re-read .env.prod and update all settings + risk engine."""
@@ -551,6 +598,8 @@ Responda com JSON:
     async def start(self) -> None:
         """Start the autonomous trading loop."""
         self._running = True
+        # AC-FIN-12: Load persisted state and rebuild Risk Engine on startup
+        self._load_state()
         logger.info("Autonomous worker started")
         logger.info("Symbols: %s", self.symbols)
         logger.info("Timeframe: %s", self.timeframe)
@@ -586,6 +635,9 @@ Responda com JSON:
 
         # Update current_price and P&L for all open positions
         self._update_positions_pnl()
+
+        # AC-FIN-12: Persist state for restart recovery
+        self._save_state()
 
         # Broadcast state update
         await self._broadcast({"type": "state_update", **self._state})
@@ -699,17 +751,18 @@ Responda com JSON:
                 quantity=risk_result.approved_quantity,
                 price=risk_result.approved_price,
                 correlation_id=decision.correlation_id,
-                risk_approved=True,
+                risk_decision=risk_result,
             )
 
             if order_result.fill_price:
-                # Update portfolio
+                # Update portfolio — AC-FIN-08: fee propagated from broker
                 from aegis.domain.enums import OrderSide
                 self.portfolio.record_fill(
                     asset=symbol,
                     side=PositionSide.LONG,
                     quantity=risk_result.approved_quantity,
                     price=order_result.fill_price,
+                    fee=order_result.fee,
                 )
 
                 # Record position

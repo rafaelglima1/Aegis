@@ -36,7 +36,7 @@ class SandboxOrder:
 class SandboxBroker(BrokerAdapter):
     """AC-08.02: SandboxBroker implements BrokerAdapter."""
 
-    def __init__(self, initial_balance: Decimal = Decimal("10000.00")) -> None:
+    def __init__(self, initial_balance: Decimal = Decimal("100.00")) -> None:
         self._balance = initial_balance
         self._orders: dict[UUID, SandboxOrder] = {}
         self._idempotency_keys: set[UUID] = set()

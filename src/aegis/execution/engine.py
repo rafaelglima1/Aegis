@@ -8,10 +8,13 @@ from uuid import UUID
 
 from aegis.domain.enums import OrderSide, OrderStatus
 from aegis.execution.broker import BrokerAdapter, OrderSubmission, OrderResult
+from aegis.risk_engine.risk_engine import RiskDecision
 
 
 class ExecutionEngine:
-    """AC-08.08: Order lifecycle follows the Order State Machine."""
+    """AC-08.08: Order lifecycle follows the Order State Machine.
+    AC-FIN-14: Risk REJECT prevents Broker.submit_order.
+    AC-FIN-15: Risk APPROVED allows Broker.submit_order."""
 
     def __init__(self, broker: BrokerAdapter) -> None:
         self._broker = broker
@@ -25,10 +28,23 @@ class ExecutionEngine:
         quantity: Decimal,
         price: Decimal,
         correlation_id: UUID,
+        risk_decision: RiskDecision | None = None,
         risk_approved: bool = False,
     ) -> OrderResult:
-        """AC-08.09: Broker cannot receive an order without Risk approval."""
-        if not risk_approved:
+        """AC-08.09: Broker cannot receive an order without Risk approval.
+
+        Accepts RiskDecision (preferred) or risk_approved bool (legacy).
+        RiskDecision is verified: only status="APPROVED" allows execution.
+        """
+        # Prefer RiskDecision authorization (non-repudiable)
+        if risk_decision is not None:
+            if not risk_decision.is_approved:
+                return OrderResult(
+                    order_id=order_id,
+                    status=OrderStatus.REJECTED,
+                    error=f"Risk rejected: {[v.code for v in risk_decision.violations]}",
+                )
+        elif not risk_approved:
             return OrderResult(
                 order_id=order_id,
                 status=OrderStatus.REJECTED,

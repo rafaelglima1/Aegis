@@ -133,7 +133,7 @@ class TradingPipeline:
                 )
                 return result
 
-            # Step 3: Execute order
+                # Step 3: Execute order
             if decision.action == TradingAction.LONG:
                 order_result = await self._execution.execute_order(
                     order_id=uuid4(),
@@ -143,7 +143,7 @@ class TradingPipeline:
                     quantity=risk_result.approved_quantity,
                     price=risk_result.approved_price,
                     correlation_id=decision.correlation_id,
-                    risk_approved=True,
+                    risk_decision=risk_result,
                 )
                 result.order_result = order_result
 
@@ -154,6 +154,7 @@ class TradingPipeline:
                         "order_id": str(order_result.order_id),
                         "status": order_result.status.value,
                         "fill_price": str(order_result.fill_price) if order_result.fill_price else None,
+                        "fee": str(order_result.fee),
                     },
                 )
 
@@ -164,6 +165,7 @@ class TradingPipeline:
                         side=PositionSide.LONG,
                         quantity=risk_result.approved_quantity,
                         price=order_result.fill_price,
+                        fee=order_result.fee,
                     )
 
                     # Record position
@@ -267,6 +269,9 @@ class TradingPipeline:
                 thesis=f"Closing position {position_id}",
             )
 
+            # Evaluate close through risk engine (CLOSE is always approved)
+            risk_decision = self._risk.evaluate(decision)
+
             # Execute close
             order_result = await self._execution.execute_order(
                 order_id=uuid4(),
@@ -276,34 +281,27 @@ class TradingPipeline:
                 quantity=Decimal(position["quantity"]),
                 price=Decimal(position["entry_price"]),
                 correlation_id=decision.correlation_id,
-                risk_approved=True,
+                risk_decision=risk_decision,
             )
 
             # Update portfolio
             if order_result.fill_price:
-                self._portfolio.record_fill(
-                    symbol=position["symbol"],
-                    side=OrderSide.SELL,
-                    quantity=Decimal(position["quantity"]),
+                pnl = self._portfolio.close_position(
+                    asset=position["symbol"],
                     price=order_result.fill_price,
+                    fee=order_result.fee,
                 )
-
-                # Calculate P&L
-                entry = Decimal(position["entry_price"])
-                exit_price = order_result.fill_price
-                qty = Decimal(position["quantity"])
-                pnl = (exit_price - entry) * qty
 
                 # Add to history
                 trade = {
                     "date": utc_now().strftime("%Y-%m-%d %H:%M"),
                     "symbol": position["symbol"],
                     "side": "LONG",
-                    "quantity": str(qty),
-                    "entry_price": str(entry),
-                    "exit_price": str(exit_price),
+                    "quantity": position["quantity"],
+                    "entry_price": position["entry_price"],
+                    "exit_price": str(order_result.fill_price),
                     "pnl": str(pnl),
-                    "fee": "0",
+                    "fee": str(order_result.fee),
                 }
                 self._state["history"].append(trade)
 

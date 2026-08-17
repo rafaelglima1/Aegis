@@ -26,6 +26,7 @@ class PositionEntry:
     take_profit: Decimal = Decimal("0")
     realized_pnl: Decimal = Decimal("0")
     unrealized_pnl: Decimal = Decimal("0")
+    entry_fee: Decimal = Decimal("0")
 
     @property
     def exposure(self) -> Decimal:
@@ -55,9 +56,10 @@ class PortfolioSnapshot:
 
 
 class Portfolio:
-    """AC-07.01: Cash balance is maintained."""
+    """AC-07.01: Cash balance is maintained.
+    AC-FIN-02: Portfolio starts with configured capital."""
 
-    def __init__(self, initial_cash: Decimal = Decimal("10000.00")) -> None:
+    def __init__(self, initial_cash: Decimal = Decimal("100.00")) -> None:
         self._cash = initial_cash
         self._positions: dict[str, PositionEntry] = {}
         self._total_realized_pnl = Decimal("0")
@@ -108,7 +110,8 @@ class Portfolio:
         price: Decimal,
         fee: Decimal = Decimal("0"),
     ) -> None:
-        """AC-07.03: Fills update positions correctly."""
+        """AC-07.03: Fills update positions correctly.
+        AC-FIN-08: Fees are propagated to Portfolio."""
         self._total_fees += fee
         self._cash -= fee
 
@@ -118,6 +121,7 @@ class Portfolio:
                 side=side,
                 status=PositionStatus.OPEN,
                 current_price=price,
+                entry_fee=fee,
             )
 
         pos = self._positions[asset]
@@ -125,6 +129,7 @@ class Portfolio:
         if pos.quantity == 0:
             pos.average_entry = price
             pos.quantity = quantity
+            pos.entry_fee = fee
         else:
             total_cost = pos.average_entry * pos.quantity + price * quantity
             pos.quantity += quantity
@@ -135,7 +140,8 @@ class Portfolio:
         self._cash -= price * quantity
 
     def close_position(self, asset: str, price: Decimal, fee: Decimal = Decimal("0")) -> Decimal:
-        """AC-07.05: Realized P&L is calculated."""
+        """AC-07.05: Realized P&L is calculated (net of fees).
+        AC-FIN-09: Realized P&L considers fees."""
         if asset not in self._positions:
             return Decimal("0")
 
@@ -145,7 +151,8 @@ class Portfolio:
 
         realized = Decimal("0")
         if pos.quantity > 0:
-            realized = (price - pos.average_entry) * pos.quantity
+            gross = (price - pos.average_entry) * pos.quantity
+            realized = gross - pos.entry_fee - fee
             self._total_realized_pnl += realized
             self._cash += price * pos.quantity
 

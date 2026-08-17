@@ -21,7 +21,7 @@ def make_submission(**overrides) -> OrderSubmission:
         idempotency_key=uuid4(),
         symbol="AAPL",
         side=OrderSide.BUY,
-        quantity=Decimal("10"),
+        quantity=Decimal("0.5"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
     )

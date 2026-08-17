@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from enum import Enum
 from functools import lru_cache
 from typing import Annotated
@@ -16,7 +17,11 @@ class TradingEnvironment(str, Enum):
 
 
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
+    """Application settings loaded from environment variables.
+
+    AC-FIN-01: initial_capital has a single source of truth.
+    AC-FIN-04: max_positions has a single source of truth.
+    """
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 
@@ -32,6 +37,16 @@ class Settings(BaseSettings):
     live_enabled: bool = Field(default=False, description="Live trading enabled")
     live_confirmation_required: bool = Field(
         default=True, description="Live confirmation required"
+    )
+
+    initial_capital: Decimal = Field(
+        default=Decimal("100.00"),
+        description="Initial capital in BRL — single source of truth for Portfolio, Risk, and Sandbox",
+    )
+
+    max_positions: int = Field(
+        default=1,
+        description="Max simultaneous positions — single source of truth for Risk, LLM, Dashboard",
     )
 
     database_url: str = Field(

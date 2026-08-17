@@ -90,7 +90,8 @@ class ExecutionOrchestrator:
         risk_approved: bool = False,
     ) -> OrderResult:
         """AC-10.01: Only Approved Order Intent can be executed.
-        AC-10.10: Idempotency prevents duplicate order submission."""
+        AC-10.10: Idempotency prevents duplicate order submission.
+        AC-FIN-14: Risk REJECT prevents Broker.submit_order."""
 
         if not risk_approved:
             self._audit("order_rejected", {"reason": "RISK_NOT_APPROVED", "order_id": str(order_id)})

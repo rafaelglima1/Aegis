@@ -91,6 +91,18 @@ class RiskEngine:
         """Record a position being closed."""
         self._positions_count = max(0, self._positions_count - 1)
 
+    def rebuild_from_open_positions(self, count: int, exposure: Decimal | None = None) -> None:
+        """AC-FIN-12: Risk Engine reconstructs state after restart.
+        AC-FIN-13: Restart does not artificially zero positions_count."""
+        self._positions_count = count
+        if exposure is not None:
+            self._current_exposure = exposure
+
+    @property
+    def positions_count(self) -> int:
+        """Current tracked position count."""
+        return self._positions_count
+
     def record_exposure_change(self, amount: Decimal) -> None:
         """Record a change in total exposure."""
         self._current_exposure += amount

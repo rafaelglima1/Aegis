@@ -103,9 +103,9 @@ def test_phase06_approved() -> None:
 
 def test_phase07_approved() -> None:
     """AC-16.01: Phase 07 approved."""
-    portfolio = Portfolio()
-    portfolio.record_fill("AAPL", OrderSide.BUY, Decimal("10"), Decimal("100.00"))
-    assert portfolio.cash < Decimal("10000.00")
+    portfolio = Portfolio(initial_cash=Decimal("100.00"))
+    portfolio.record_fill("AAPL", OrderSide.BUY, Decimal("1"), Decimal("50.00"))
+    assert portfolio.cash < Decimal("100.00")
 
 
 def test_phase08_approved() -> None:
@@ -174,8 +174,8 @@ def test_no_mandatory_fails() -> None:
 def test_full_suite_passes() -> None:
     """AC-16.04: Complete automated test suite passes."""
     portfolio = Portfolio()
-    portfolio.record_fill("AAPL", OrderSide.BUY, Decimal("10"), Decimal("100.00"))
-    assert portfolio.cash == Decimal("9000.00")
+    portfolio.record_fill("AAPL", OrderSide.BUY, Decimal("0.5"), Decimal("100.00"))
+    assert portfolio.cash == Decimal("50.00")
     assert "AAPL" in portfolio.positions
 
 
@@ -191,7 +191,7 @@ async def test_e2e_suite_passes() -> None:
         idempotency_key=uuid4(),
         symbol="AAPL",
         side=OrderSide.BUY,
-        quantity=Decimal("10"),
+        quantity=Decimal("0.5"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
         risk_approved=True,
@@ -268,9 +268,9 @@ async def test_chaos_recovery_certification() -> None:
 def test_backup_restore_certification() -> None:
     """AC-16.10: Backup/restore certification passes."""
     portfolio = Portfolio()
-    portfolio.record_fill("AAPL", OrderSide.BUY, Decimal("10"), Decimal("100.00"))
+    portfolio.record_fill("AAPL", OrderSide.BUY, Decimal("0.5"), Decimal("100.00"))
     snapshot = portfolio.snapshot()
-    assert snapshot.cash == Decimal("9000.00")
+    assert snapshot.cash == Decimal("50.00")
 
 
 # === AC-16.11: Sandbox execution certification passes ===
@@ -285,7 +285,7 @@ async def test_sandbox_execution_certification() -> None:
         idempotency_key=uuid4(),
         symbol="AAPL",
         side=OrderSide.BUY,
-        quantity=Decimal("10"),
+        quantity=Decimal("0.5"),
         price=Decimal("100.00"),
         correlation_id=uuid4(),
         risk_approved=True,

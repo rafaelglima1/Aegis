@@ -36,10 +36,10 @@ def make_candles(count: int = 5) -> list[Candle]:
 @pytest.mark.asyncio
 async def test_sandbox_pipeline_e2e() -> None:
     """AC-15.01: Complete SANDBOX pipeline operates successfully."""
-    broker = SandboxBroker()
+    broker = SandboxBroker(initial_balance=Decimal("1000.00"))
     engine = ExecutionEngine(broker)
     risk = RiskEngine()
-    portfolio = Portfolio()
+    portfolio = Portfolio(initial_cash=Decimal("100.00"))
     audit = AuditLogger()
 
     decision = DecisionContract(
@@ -60,15 +60,15 @@ async def test_sandbox_pipeline_e2e() -> None:
         idempotency_key=uuid4(),
         symbol="AAPL",
         side=OrderSide.BUY,
-        quantity=Decimal("10"),
-        price=Decimal("100.00"),
+        quantity=Decimal("1"),
+        price=Decimal("50.00"),
         correlation_id=uuid4(),
         risk_approved=True,
     )
     assert result.status == OrderStatus.FILLED
 
-    portfolio.record_fill("AAPL", OrderSide.BUY, Decimal("10"), Decimal("100.00"))
-    assert portfolio.cash < Decimal("10000.00")
+    portfolio.record_fill("AAPL", OrderSide.BUY, Decimal("1"), Decimal("50.00"), fee=result.fee)
+    assert portfolio.cash < Decimal("100.00")
 
     audit.record_order(uuid4(), "execution", "submit", {"order_id": str(order_id)})
     assert len(audit.events) > 0
@@ -77,10 +77,10 @@ async def test_sandbox_pipeline_e2e() -> None:
 @pytest.mark.asyncio
 async def test_market_data_to_audit_e2e() -> None:
     """AC-15.02: Market Data→AI→Risk→Execution→Fill→Portfolio→Audit works end-to-end."""
-    broker = SandboxBroker()
+    broker = SandboxBroker(initial_balance=Decimal("1000.00"))
     orchestrator = ExecutionOrchestrator(broker)
     risk = RiskEngine()
-    portfolio = Portfolio()
+    portfolio = Portfolio(initial_cash=Decimal("100.00"))
     audit = AuditLogger()
 
     correlation_id = uuid4()
@@ -115,7 +115,7 @@ async def test_market_data_to_audit_e2e() -> None:
 
     audit.record_order(correlation_id, "execution", "fill", {"status": "FILLED"})
 
-    portfolio.record_fill("AAPL", OrderSide.BUY, Decimal("10"), Decimal("100.00"))
+    portfolio.record_fill("AAPL", OrderSide.BUY, Decimal("1"), Decimal("50.00"))
 
     events = audit.get_events_by_correlation(correlation_id)
     assert len(events) == 3
