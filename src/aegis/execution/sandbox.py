@@ -133,8 +133,13 @@ class SandboxBroker(BrokerAdapter):
             )
         else:
             # BUY: existing behavior
-            required_cost = submission.price * submission.quantity
-            if self._balance < required_cost:
+            # C6-04: BUY slippage is unfavorable to buyer (fill_price > price)
+            slippage = submission.price * self._slippage_bps
+            fill_price = submission.price + slippage
+
+            # C9-10: Balance deduction uses effective fill_price, not requested price
+            gross_cost = fill_price * submission.quantity
+            if self._balance < gross_cost + fee:
                 order = SandboxOrder(
                     order_id=submission.order_id,
                     idempotency_key=submission.idempotency_key,
@@ -151,10 +156,6 @@ class SandboxBroker(BrokerAdapter):
                     error="Insufficient balance",
                 )
 
-            # C6-04: BUY slippage is unfavorable to buyer (fill_price > price)
-            slippage = submission.price * self._slippage_bps
-            fill_price = submission.price + slippage
-
             order = SandboxOrder(
                 order_id=submission.order_id,
                 idempotency_key=submission.idempotency_key,
@@ -168,7 +169,7 @@ class SandboxBroker(BrokerAdapter):
                 fee=fee,
             )
             self._orders[submission.order_id] = order
-            self._balance -= required_cost + fee
+            self._balance -= gross_cost + fee
 
             return OrderResult(
                 order_id=submission.order_id,

@@ -77,7 +77,7 @@ async def test_sandbox_pipeline_e2e() -> None:
 @pytest.mark.asyncio
 async def test_market_data_to_audit_e2e() -> None:
     """AC-15.02: Market Data→AI→Risk→Execution→Fill→Portfolio→Audit works end-to-end."""
-    broker = SandboxBroker(initial_balance=Decimal("1000.00"))
+    broker = SandboxBroker(initial_balance=Decimal("2000.00"))
     orchestrator = ExecutionOrchestrator(broker)
     risk = RiskEngine()
     portfolio = Portfolio(initial_cash=Decimal("100.00"))

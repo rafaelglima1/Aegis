@@ -558,8 +558,8 @@ class TestSandboxBrokerSELL:
         # BUY slippage: fill_price = price + slippage
         assert buy_fill > Decimal("50.00")
 
-        # Balance: initial - (buy_price * qty + buy_fee) + (sell_fill * qty - sell_fee)
-        expected = Decimal("100.00") - (Decimal("50.00") * Decimal("1") + buy_fee) + (sell_fill * Decimal("1") - sell_fee)
+        # Balance: initial - (buy_fill * qty + buy_fee) + (sell_fill * qty - sell_fee)
+        expected = Decimal("100.00") - (buy_fill * Decimal("1") + buy_fee) + (sell_fill * Decimal("1") - sell_fee)
         assert broker.balance == expected
 
     @pytest.mark.asyncio

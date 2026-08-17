@@ -602,6 +602,6 @@ class TestCorrection7Safety:
         try:
             result = loop.run_until_complete(broker.submit_order(submission))
             assert result.status == OrderStatus.REJECTED
-            assert "SELL not allowed" in result.error
+            assert "SELL rejected" in result.error
         finally:
             loop.close()

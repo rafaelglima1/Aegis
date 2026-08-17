@@ -637,6 +637,10 @@ Responda com JSON:
             else:
                 self.risk_engine._peak_equity = self.risk_engine._limits.reference_capital
 
+            # C9-19: Sync broker balance with Portfolio (Portfolio is source of truth)
+            if hasattr(self.broker, "_balance"):
+                self.broker._balance = self.portfolio.cash
+
             logger.info(
                 "State restored: %d open positions, capital R$ %s, P&L R$ %s, exposure R$ %s, peak_equity R$ %s",
                 open_count,
@@ -649,16 +653,18 @@ Responda com JSON:
             logger.error("Failed to load state: %s", e)
 
     def _reload_config(self) -> None:
-        """Re-read .env.prod and update all settings + risk engine."""
+        """Re-read .env.prod and update risk settings.
+        C9-06: Settings is the configuration source; hot-reload propagates consistently.
+        C9-08/C9-09: initial_capital is NOT overwritten — Portfolio/Broker are NOT corrupted."""
         env = _read_env_file()
         if not env:
             return
 
-        # Update basic settings
+        # Update operational settings (NOT initial_capital — that's immutable after construction)
         self.symbols = env.get("TRADING_SYMBOLS", ",".join(self.symbols)).split(",")
         self.timeframe = env.get("TRADING_TIMEFRAME", self.timeframe)
-        self.capital = Decimal(env.get("TRADING_CAPITAL", str(self.capital)))
         self.risk_pct = Decimal(env.get("RISK_PER_TRADE_PCT", str(self.risk_pct * 100))) / Decimal("100")
+        # C9-07: max_positions propagates from env → Worker → RiskEngine
         self.max_positions = int(env.get("MAX_POSITIONS", str(self.max_positions)))
         self.mandatory_stop = env.get("MANDATORY_STOP", str(self.mandatory_stop).lower()).lower() == "true"
         self.mandatory_take_profit = env.get("MANDATORY_TAKE_PROFIT", str(self.mandatory_take_profit).lower()).lower() == "true"
@@ -669,7 +675,7 @@ Responda com JSON:
         self.min_confidence = Decimal(env.get("MIN_CONFIDENCE", str(self.min_confidence)))
         self.circuit_breaker_pct = Decimal(env.get("CIRCUIT_BREAKER_PCT", str(self.circuit_breaker_pct * 100))) / Decimal("100")
 
-        # Update risk engine limits
+        # Update risk engine limits (reference_capital stays unchanged — Portfolio is source of truth)
         self.risk_engine.limits = RiskLimits(
             reference_capital=self.capital,
             max_risk_per_trade_pct=self.risk_pct,

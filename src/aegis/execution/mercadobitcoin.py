@@ -167,7 +167,7 @@ class MercadoBitcoinBroker(BrokerAdapter):
 
         V1.0 Rules:
         - Spot only (no leverage)
-        - Long only (BUY only)
+        - Long only: BUY opens LONG, SELL closes LONG (no SHORT)
         - BRL pairs (BTC-BRL, ETH-BRL, etc.)
         """
         if not self._config.enabled:
@@ -195,12 +195,31 @@ class MercadoBitcoinBroker(BrokerAdapter):
             )
 
         if submission.side == OrderSide.SELL:
-            self._audit("order_blocked", {"reason": "SHORT_NOT_ALLOWED", "order_id": str(submission.order_id)})
-            return OrderResult(
-                order_id=submission.order_id,
-                status=OrderStatus.REJECTED,
-                error="V1.0: Long only, SELL not allowed",
-            )
+            # C9-02: SELL is allowed ONLY to close an existing LONG position.
+            # C9-03: SELL without a corresponding LONG position is rejected.
+            # C9-04: SHORT is not created — SELL represents closing LONG only.
+            position = await self.get_position(submission.symbol)
+            available_qty = position.get("quantity", Decimal("0"))
+            if available_qty <= 0:
+                self._audit("order_blocked", {
+                    "reason": "NO_POSITION_TO_SELL",
+                    "order_id": str(submission.order_id),
+                })
+                return OrderResult(
+                    order_id=submission.order_id,
+                    status=OrderStatus.REJECTED,
+                    error=f"SELL rejected: no open LONG position for {submission.symbol}",
+                )
+            if submission.quantity > available_qty:
+                self._audit("order_blocked", {
+                    "reason": "SELL_QUANTITY_EXCEEDS_POSITION",
+                    "order_id": str(submission.order_id),
+                })
+                return OrderResult(
+                    order_id=submission.order_id,
+                    status=OrderStatus.REJECTED,
+                    error=f"Sell quantity {submission.quantity} exceeds position {available_qty}",
+                )
 
         if submission.idempotency_key in self._idempotency_keys:
             existing = self._orders.get(submission.order_id)
@@ -222,9 +241,10 @@ class MercadoBitcoinBroker(BrokerAdapter):
         # MB API v4: symbol format is BTC-BRL (with dash)
         # Create order: POST /api/v4/orders
         try:
+            side_str = "buy" if submission.side == OrderSide.BUY else "sell"
             order_data = {
                 "symbol": submission.symbol,
-                "side": "buy",
+                "side": side_str,
                 "type": "limit",
                 "quantity": str(submission.quantity),
                 "limit_price": str(submission.price),

@@ -155,7 +155,7 @@ async def test_sandbox_no_live_credentials() -> None:
 @pytest.mark.asyncio
 async def test_sandbox_balance_deducted() -> None:
     """AC-08.11: Sandbox execution tests pass."""
-    broker = SandboxBroker(initial_balance=Decimal("1000.00"))
+    broker = SandboxBroker(initial_balance=Decimal("2000.00"))
     submission = make_submission(quantity=Decimal("10"), price=Decimal("100.00"))
     result = await broker.submit_order(submission)
     assert result.status == OrderStatus.FILLED
