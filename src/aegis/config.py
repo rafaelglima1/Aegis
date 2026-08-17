@@ -7,7 +7,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import Annotated
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -41,11 +41,13 @@ class Settings(BaseSettings):
 
     initial_capital: Decimal = Field(
         default=Decimal("100.00"),
+        validation_alias=AliasChoices("initial_capital", "TRADING_CAPITAL"),
         description="Initial capital in BRL — single source of truth for Portfolio, Risk, and Sandbox",
     )
 
     max_positions: int = Field(
         default=1,
+        validation_alias=AliasChoices("max_positions", "MAX_POSITIONS"),
         description="Max simultaneous positions — single source of truth for Risk, LLM, Dashboard",
     )
 

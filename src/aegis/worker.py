@@ -298,16 +298,23 @@ class AutonomousWorker:
     6. Update state and broadcast
     """
 
-    def __init__(self) -> None:
-        # Load config from environment (set by docker-compose env_file)
+    def __init__(self, settings: Any | None = None) -> None:
+        # AC-C8-01/AC-C8-02: Settings is the single source of truth for capital and max_positions
+        if settings is None:
+            from aegis.config import get_settings as _get_settings
+            settings = _get_settings()
+
+        self._settings = settings
+
+        # Load config from Settings (single source of truth)
         self.llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
         self.llm_api_key = os.getenv("LLM_API_KEY", "")
         self.llm_model = os.getenv("LLM_MODEL", "gpt-4")
         self.symbols = os.getenv("TRADING_SYMBOLS", "BTC-BRL,ETH-BRL").split(",")
         self.timeframe = os.getenv("TRADING_TIMEFRAME", "1h")
-        self.capital = Decimal(os.getenv("TRADING_CAPITAL", "100.0"))
+        self.capital = settings.initial_capital
         self.risk_pct = Decimal(os.getenv("RISK_PER_TRADE_PCT", "1.0")) / Decimal("100")
-        self.max_positions = int(os.getenv("MAX_POSITIONS", "1"))
+        self.max_positions = settings.max_positions
         self.mandatory_stop = os.getenv("MANDATORY_STOP", "true").lower() == "true"
         self.mandatory_take_profit = os.getenv("MANDATORY_TAKE_PROFIT", "true").lower() == "true"
         self.long_only = os.getenv("LONG_ONLY", "true").lower() == "true"
