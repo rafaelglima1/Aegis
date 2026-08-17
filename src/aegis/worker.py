@@ -653,19 +653,38 @@ Responda com JSON:
             logger.error("Failed to load state: %s", e)
 
     def _reload_config(self) -> None:
-        """Re-read .env.prod and update risk settings.
-        C9-06: Settings is the configuration source; hot-reload propagates consistently.
-        C9-08/C9-09: initial_capital is NOT overwritten — Portfolio/Broker are NOT corrupted."""
+        """Re-read .env.prod and rebuild configuration consistently.
+
+        C9.1-01/02/03: env file → Settings → Worker → RiskEngine.
+        C9.1-04/05/06: initial_capital is NOT overwritten — Portfolio/Broker/P&L unchanged.
+        Settings is the single source of truth for max_positions.
+        """
         env = _read_env_file()
         if not env:
             return
 
-        # Update operational settings (NOT initial_capital — that's immutable after construction)
+        # C9.1: Build a fresh Settings from env values for Settings-owned fields.
+        # Settings is the single source of truth for max_positions.
+        from aegis.config import Settings, TradingEnvironment
+
+        settings_kwargs: dict[str, Any] = {}
+        if "TRADING_ENVIRONMENT" in env:
+            settings_kwargs["trading_environment"] = TradingEnvironment(env["TRADING_ENVIRONMENT"])
+        if "LIVE_ENABLED" in env:
+            settings_kwargs["live_enabled"] = env["LIVE_ENABLED"].lower() == "true"
+        if "MAX_POSITIONS" in env:
+            settings_kwargs["max_positions"] = int(env["MAX_POSITIONS"])
+
+        new_settings = Settings(**settings_kwargs)
+        self._settings = new_settings
+
+        # C9.1: max_positions flows through Settings (single source of truth)
+        self.max_positions = new_settings.max_positions
+
+        # Propagate other operational settings from env (not managed by Settings)
         self.symbols = env.get("TRADING_SYMBOLS", ",".join(self.symbols)).split(",")
         self.timeframe = env.get("TRADING_TIMEFRAME", self.timeframe)
         self.risk_pct = Decimal(env.get("RISK_PER_TRADE_PCT", str(self.risk_pct * 100))) / Decimal("100")
-        # C9-07: max_positions propagates from env → Worker → RiskEngine
-        self.max_positions = int(env.get("MAX_POSITIONS", str(self.max_positions)))
         self.mandatory_stop = env.get("MANDATORY_STOP", str(self.mandatory_stop).lower()).lower() == "true"
         self.mandatory_take_profit = env.get("MANDATORY_TAKE_PROFIT", str(self.mandatory_take_profit).lower()).lower() == "true"
         self.long_only = env.get("LONG_ONLY", str(self.long_only).lower()).lower() == "true"
@@ -675,7 +694,7 @@ Responda com JSON:
         self.min_confidence = Decimal(env.get("MIN_CONFIDENCE", str(self.min_confidence)))
         self.circuit_breaker_pct = Decimal(env.get("CIRCUIT_BREAKER_PCT", str(self.circuit_breaker_pct * 100))) / Decimal("100")
 
-        # Update risk engine limits (reference_capital stays unchanged — Portfolio is source of truth)
+        # C9.1: Propagate from Worker → RiskEngine (reference_capital stays unchanged)
         self.risk_engine.limits = RiskLimits(
             reference_capital=self.capital,
             max_risk_per_trade_pct=self.risk_pct,

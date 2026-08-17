@@ -175,27 +175,28 @@ class TestSellBehindRiskGate:
 
 class TestHotReloadMaxPositions:
 
-    def test_max_positions_propagates_to_risk_engine(self) -> None:
+    def test_max_positions_propagates_to_risk_engine(self, tmp_path: Path) -> None:
+        """C9-06: Real _reload_config propagates max_positions through Settings."""
         from aegis.config import Settings
         from aegis.worker import AutonomousWorker
+        import aegis.worker as worker_mod
+
+        # Write temp env file
+        env_file = tmp_path / ".env.prod"
+        env_file.write_text("MAX_POSITIONS=3\nTRADING_CAPITAL=100.00\n", encoding="utf-8")
+        worker_mod._SETTINGS_FILE = env_file
 
         settings = Settings(max_positions=1)
         worker = AutonomousWorker(settings=settings)
         assert worker.max_positions == 1
         assert worker.risk_engine.limits.max_simultaneous_positions == 1
 
-        worker.max_positions = 3
-        worker.risk_engine.limits = RiskLimits(
-            reference_capital=worker.capital,
-            max_risk_per_trade_pct=worker.risk_pct,
-            max_simultaneous_positions=worker.max_positions,
-            circuit_breaker_drawdown_pct=worker.circuit_breaker_pct,
-            max_daily_loss_pct=worker.max_daily_loss_pct,
-            max_position_size_pct=worker.max_position_size_pct,
-            max_exposure_pct=worker.max_exposure_pct,
-        )
+        # Execute REAL reload mechanism
+        worker._reload_config()
+
         assert worker.max_positions == 3
         assert worker.risk_engine.limits.max_simultaneous_positions == 3
+        assert worker._settings.max_positions == 3
 
 
 # ============================================================
@@ -205,24 +206,24 @@ class TestHotReloadMaxPositions:
 
 class TestHotReloadNoCashCorruption:
 
-    def test_hot_reload_preserves_portfolio_cash(self) -> None:
+    def test_hot_reload_preserves_portfolio_cash(self, tmp_path: Path) -> None:
+        """C9-07: Real _reload_config preserves Portfolio cash."""
         from aegis.config import Settings
         from aegis.worker import AutonomousWorker
+        import aegis.worker as worker_mod
+
+        env_file = tmp_path / ".env.prod"
+        env_file.write_text("MAX_POSITIONS=1\nTRADING_CAPITAL=100.00\n", encoding="utf-8")
+        worker_mod._SETTINGS_FILE = env_file
 
         settings = Settings(initial_capital=Decimal("100.00"))
         worker = AutonomousWorker(settings=settings)
         original_cash = worker.portfolio.cash
 
-        worker.max_positions = 5
-        worker.risk_engine.limits = RiskLimits(
-            reference_capital=worker.capital,
-            max_risk_per_trade_pct=worker.risk_pct,
-            max_simultaneous_positions=worker.max_positions,
-            circuit_breaker_drawdown_pct=worker.circuit_breaker_pct,
-            max_daily_loss_pct=worker.max_daily_loss_pct,
-            max_position_size_pct=worker.max_position_size_pct,
-            max_exposure_pct=worker.max_exposure_pct,
-        )
+        # Write new config and reload
+        env_file.write_text("MAX_POSITIONS=5\nTRADING_CAPITAL=999.00\n", encoding="utf-8")
+        worker._reload_config()
+
         assert worker.portfolio.cash == original_cash
 
 
@@ -233,24 +234,23 @@ class TestHotReloadNoCashCorruption:
 
 class TestHotReloadNoBrokerCorruption:
 
-    def test_hot_reload_preserves_broker_balance(self) -> None:
+    def test_hot_reload_preserves_broker_balance(self, tmp_path: Path) -> None:
+        """C9-08: Real _reload_config preserves Broker balance."""
         from aegis.config import Settings
         from aegis.worker import AutonomousWorker
+        import aegis.worker as worker_mod
+
+        env_file = tmp_path / ".env.prod"
+        env_file.write_text("MAX_POSITIONS=1\nTRADING_CAPITAL=100.00\n", encoding="utf-8")
+        worker_mod._SETTINGS_FILE = env_file
 
         settings = Settings(initial_capital=Decimal("100.00"))
         worker = AutonomousWorker(settings=settings)
         original_balance = worker.broker.balance
 
-        worker.max_positions = 5
-        worker.risk_engine.limits = RiskLimits(
-            reference_capital=worker.capital,
-            max_risk_per_trade_pct=worker.risk_pct,
-            max_simultaneous_positions=worker.max_positions,
-            circuit_breaker_drawdown_pct=worker.circuit_breaker_pct,
-            max_daily_loss_pct=worker.max_daily_loss_pct,
-            max_position_size_pct=worker.max_position_size_pct,
-            max_exposure_pct=worker.max_exposure_pct,
-        )
+        env_file.write_text("MAX_POSITIONS=5\nTRADING_CAPITAL=999.00\n", encoding="utf-8")
+        worker._reload_config()
+
         assert worker.broker.balance == original_balance
 
 
