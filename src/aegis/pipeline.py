@@ -59,7 +59,8 @@ class TradingPipeline:
         if broker is None:
             from aegis.execution.factory import create_broker
             from aegis.config import get_settings
-            broker = create_broker(get_settings())
+            _portfolio = portfolio or Portfolio()
+            broker = create_broker(get_settings(), initial_balance=_portfolio.cash)
         self._broker = broker
         self._execution = ExecutionEngine(self._broker)
         self._portfolio = portfolio or Portfolio()

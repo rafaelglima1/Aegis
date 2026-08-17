@@ -406,10 +406,12 @@ class TestCloseArchitecture:
         close_decisions = [d for d in evaluate_calls if d.action == TradingAction.CLOSE]
         assert len(close_decisions) == 1
 
-    def test_manual_close_passes_risk_engine(self) -> None:
+    @pytest.mark.asyncio
+    async def test_manual_close_passes_risk_engine(self) -> None:
         """Worker manual CLOSE creates DecisionContract and calls evaluate()."""
         from aegis.worker import AutonomousWorker
         import aegis.worker as worker_mod
+        from aegis.execution.engine import ExecutionEngine
 
         with patch.object(worker_mod, "_STATE_FILE", Path("/tmp/test_state.json")):
             worker = AutonomousWorker()
@@ -428,6 +430,16 @@ class TestCloseArchitecture:
                 "status": "OPEN",
             }]
 
+            async def mock_execute(*args, **kwargs):
+                return OrderResult(
+                    order_id=kwargs.get("order_id", uuid4()),
+                    status=OrderStatus.FILLED,
+                    fill_price=Decimal("60.00"),
+                    fill_quantity=kwargs.get("quantity", Decimal("1")),
+                    fee=Decimal("0.50"),
+                )
+            worker.execution.execute_order = mock_execute
+
             # Patch evaluate
             evaluate_calls = []
             original_evaluate = worker.risk_engine.evaluate
@@ -438,7 +450,7 @@ class TestCloseArchitecture:
 
             worker.risk_engine.evaluate = tracking_evaluate
 
-            result = worker.close_position_manual(pos_id)
+            result = await worker.close_position_manual(pos_id)
             assert result["status"] == "CLOSED"
 
             # Verify RiskEngine was called with CLOSE decision

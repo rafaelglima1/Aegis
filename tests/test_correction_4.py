@@ -219,53 +219,99 @@ class TestDashboardCloseEndpoint:
         }
         return worker
 
-    def test_close_existing_position(self) -> None:
+    @pytest.mark.asyncio
+    async def test_close_existing_position(self) -> None:
         """Closing an existing OPEN position succeeds."""
         worker = self._make_worker_with_position()
         pos_id = worker._state["positions"][0]["id"]
 
-        result = worker.close_position_manual(pos_id)
+        async def mock_execute(*args, **kwargs):
+            return OrderResult(
+                order_id=kwargs.get("order_id", uuid4()),
+                status=OrderStatus.FILLED,
+                fill_price=Decimal("60.00"),
+                fill_quantity=kwargs.get("quantity", Decimal("1")),
+                fee=Decimal("0.50"),
+            )
+        worker.execution.execute_order = mock_execute
+
+        result = await worker.close_position_manual(pos_id)
 
         assert result["status"] == "CLOSED"
         assert "pnl" in result
         assert "capital" in result
 
-    def test_close_nonexistent_position(self) -> None:
+    @pytest.mark.asyncio
+    async def test_close_nonexistent_position(self) -> None:
         """Closing a nonexistent position returns NOT_FOUND."""
         worker = self._make_worker_with_position()
 
-        result = worker.close_position_manual(str(uuid4()))
+        result = await worker.close_position_manual(str(uuid4()))
 
         assert result["status"] == "NOT_FOUND"
 
-    def test_position_marked_closed(self) -> None:
+    @pytest.mark.asyncio
+    async def test_position_marked_closed(self) -> None:
         """After close, position status must be CLOSED."""
         worker = self._make_worker_with_position()
         pos_id = worker._state["positions"][0]["id"]
 
-        worker.close_position_manual(pos_id)
+        async def mock_execute(*args, **kwargs):
+            return OrderResult(
+                order_id=kwargs.get("order_id", uuid4()),
+                status=OrderStatus.FILLED,
+                fill_price=Decimal("60.00"),
+                fill_quantity=kwargs.get("quantity", Decimal("1")),
+                fee=Decimal("0.50"),
+            )
+        worker.execution.execute_order = mock_execute
+
+        await worker.close_position_manual(pos_id)
 
         assert worker._state["positions"][0]["status"] == "CLOSED"
 
-    def test_capital_updated_from_portfolio(self) -> None:
+    @pytest.mark.asyncio
+    async def test_capital_updated_from_portfolio(self) -> None:
         """After close, capital must equal portfolio.cash."""
         worker = self._make_worker_with_position()
         pos_id = worker._state["positions"][0]["id"]
 
-        worker.close_position_manual(pos_id)
+        async def mock_execute(*args, **kwargs):
+            return OrderResult(
+                order_id=kwargs.get("order_id", uuid4()),
+                status=OrderStatus.FILLED,
+                fill_price=Decimal("60.00"),
+                fill_quantity=kwargs.get("quantity", Decimal("1")),
+                fee=Decimal("0.50"),
+            )
+        worker.execution.execute_order = mock_execute
+
+        await worker.close_position_manual(pos_id)
 
         assert Decimal(worker._state["capital"]) == worker.portfolio.cash
 
-    def test_pnl_updated_from_portfolio(self) -> None:
+    @pytest.mark.asyncio
+    async def test_pnl_updated_from_portfolio(self) -> None:
         """After close, pnl must equal portfolio.total_realized_pnl."""
         worker = self._make_worker_with_position()
         pos_id = worker._state["positions"][0]["id"]
 
-        worker.close_position_manual(pos_id)
+        async def mock_execute(*args, **kwargs):
+            return OrderResult(
+                order_id=kwargs.get("order_id", uuid4()),
+                status=OrderStatus.FILLED,
+                fill_price=Decimal("60.00"),
+                fill_quantity=kwargs.get("quantity", Decimal("1")),
+                fee=Decimal("0.50"),
+            )
+        worker.execution.execute_order = mock_execute
+
+        await worker.close_position_manual(pos_id)
 
         assert Decimal(worker._state["pnl"]) == worker.portfolio.total_realized_pnl
 
-    def test_pnl_is_net_of_fees(self) -> None:
+    @pytest.mark.asyncio
+    async def test_pnl_is_net_of_fees(self) -> None:
         """P&L must account for both entry and exit fees."""
         worker = self._make_worker_with_position()
         # Simulate entry fee by recording fill
@@ -278,41 +324,86 @@ class TestDashboardCloseEndpoint:
         )
 
         pos_id = worker._state["positions"][0]["id"]
-        result = worker.close_position_manual(pos_id)
+
+        async def mock_execute(*args, **kwargs):
+            return OrderResult(
+                order_id=kwargs.get("order_id", uuid4()),
+                status=OrderStatus.FILLED,
+                fill_price=Decimal("60.00"),
+                fill_quantity=kwargs.get("quantity", Decimal("1")),
+                fee=Decimal("0.50"),
+            )
+        worker.execution.execute_order = mock_execute
+
+        result = await worker.close_position_manual(pos_id)
 
         # gross = (60 - 50) * 1 = 10, net = 10 - entry_fee(0.50) - exit_fee(0.50) = 9.00
         assert Decimal(result["pnl"]) == Decimal("9.00")
         assert Decimal(worker._state["capital"]) == worker.portfolio.cash
 
-    def test_history_recorded(self) -> None:
+    @pytest.mark.asyncio
+    async def test_history_recorded(self) -> None:
         """Close must append trade to history."""
         worker = self._make_worker_with_position()
         pos_id = worker._state["positions"][0]["id"]
 
-        worker.close_position_manual(pos_id)
+        async def mock_execute(*args, **kwargs):
+            return OrderResult(
+                order_id=kwargs.get("order_id", uuid4()),
+                status=OrderStatus.FILLED,
+                fill_price=Decimal("60.00"),
+                fill_quantity=kwargs.get("quantity", Decimal("1")),
+                fee=Decimal("0.50"),
+            )
+        worker.execution.execute_order = mock_execute
+
+        await worker.close_position_manual(pos_id)
 
         assert len(worker._state["history"]) == 1
         trade = worker._state["history"][0]
         assert trade["symbol"] == "BTC-BRL"
         assert trade["status"] if "status" in trade else True  # no status in history, that's fine
 
-    def test_risk_engine_decremented(self) -> None:
+    @pytest.mark.asyncio
+    async def test_risk_engine_decremented(self) -> None:
         """RiskEngine position count must decrement after close."""
         worker = self._make_worker_with_position()
         worker.risk_engine.record_position_open()  # simulate open from risk perspective
 
         pos_id = worker._state["positions"][0]["id"]
-        worker.close_position_manual(pos_id)
+
+        async def mock_execute(*args, **kwargs):
+            return OrderResult(
+                order_id=kwargs.get("order_id", uuid4()),
+                status=OrderStatus.FILLED,
+                fill_price=Decimal("60.00"),
+                fill_quantity=kwargs.get("quantity", Decimal("1")),
+                fee=Decimal("0.50"),
+            )
+        worker.execution.execute_order = mock_execute
+
+        await worker.close_position_manual(pos_id)
 
         assert worker.risk_engine._positions_count == 0
 
-    def test_already_closed_position_not_closeable(self) -> None:
+    @pytest.mark.asyncio
+    async def test_already_closed_position_not_closeable(self) -> None:
         """Closing an already CLOSED position returns NOT_FOUND."""
         worker = self._make_worker_with_position()
         pos_id = worker._state["positions"][0]["id"]
 
-        worker.close_position_manual(pos_id)
-        result = worker.close_position_manual(pos_id)
+        async def mock_execute(*args, **kwargs):
+            return OrderResult(
+                order_id=kwargs.get("order_id", uuid4()),
+                status=OrderStatus.FILLED,
+                fill_price=Decimal("60.00"),
+                fill_quantity=kwargs.get("quantity", Decimal("1")),
+                fee=Decimal("0.50"),
+            )
+        worker.execution.execute_order = mock_execute
+
+        await worker.close_position_manual(pos_id)
+        result = await worker.close_position_manual(pos_id)
 
         assert result["status"] == "NOT_FOUND"
 

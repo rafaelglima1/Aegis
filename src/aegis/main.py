@@ -749,9 +749,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.getElementById('risk-exposure-limit').textContent = maxExposurePct + '%';
             document.getElementById('risk-bar').style.width = Math.min(exposurePct, 100) + '%';
             document.getElementById('risk-bar').className = 'fill ' + (exposurePct < 50 ? 'green' : exposurePct < 80 ? 'yellow' : 'red');
-            // Drawdown bar
-            const peakEquity = parseFloat(state.peak_equity) || capital;
-            const drawdown = peakEquity > 0 ? ((peakEquity - capital) / peakEquity * 100) : 0;
+            // Drawdown bar — C7-05: uses equity (cash + unrealized_pnl), not just cash
+            const equity = parseFloat(state.equity) || capital;
+            const peakEquity = parseFloat(state.peak_equity) || equity;
+            const drawdown = peakEquity > 0 ? ((peakEquity - equity) / peakEquity * 100) : 0;
             const circuitBreaker = parseFloat(rl.circuit_breaker_pct) || 10;
             document.getElementById('risk-drawdown').textContent = Math.max(0, drawdown).toFixed(1) + '%';
             document.getElementById('risk-drawdown-limit').textContent = circuitBreaker + '%';
@@ -1218,7 +1219,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from aegis.worker import get_worker
         worker = get_worker()
 
-        result = worker.close_position_manual(position_id)
+        result = await worker.close_position_manual(position_id)
 
         if result["status"] == "NOT_FOUND":
             return {"status": "error", "error": result["error"]}

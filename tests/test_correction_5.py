@@ -442,7 +442,8 @@ class TestClosePriceNotEntryPrice:
         finally:
             loop.close()
 
-    def test_c5_02_14_manual_close_consistent_with_autonomous(self) -> None:
+    @pytest.mark.asyncio
+    async def test_c5_02_14_manual_close_consistent_with_autonomous(self) -> None:
         """Worker.close_position_manual must produce consistent accounting."""
         from aegis.worker import AutonomousWorker
 
@@ -470,7 +471,17 @@ class TestClosePriceNotEntryPrice:
         }
         pos_id = worker._state["positions"][0]["id"]
 
-        result = worker.close_position_manual(pos_id)
+        async def mock_execute(*args, **kwargs):
+            return OrderResult(
+                order_id=kwargs.get("order_id", uuid4()),
+                status=OrderStatus.FILLED,
+                fill_price=Decimal("60.00"),
+                fill_quantity=kwargs.get("quantity", Decimal("1")),
+                fee=Decimal("0.50"),
+            )
+        worker.execution.execute_order = mock_execute
+
+        result = await worker.close_position_manual(pos_id)
 
         assert result["status"] == "CLOSED"
         assert Decimal(result["capital"]) == worker.portfolio.cash
@@ -788,7 +799,8 @@ class TestPortfolioReconstruction:
         finally:
             worker_mod._STATE_FILE = Path("/home/ubuntu/aegis/worker_state.json")
 
-    def test_c5_03_28_close_works_after_restart(self, tmp_path) -> None:
+    @pytest.mark.asyncio
+    async def test_c5_03_28_close_works_after_restart(self, tmp_path) -> None:
         """After restart, closing a position updates portfolio correctly."""
         import aegis.worker as worker_mod
         worker_mod._STATE_FILE = tmp_path / "worker_state.json"
@@ -801,8 +813,18 @@ class TestPortfolioReconstruction:
             worker2.portfolio = Portfolio(initial_cash=Decimal("200.00"))
             worker2._load_state()
 
+            async def mock_execute(*args, **kwargs):
+                return OrderResult(
+                    order_id=kwargs.get("order_id", uuid4()),
+                    status=OrderStatus.FILLED,
+                    fill_price=Decimal("60.00"),
+                    fill_quantity=kwargs.get("quantity", Decimal("1")),
+                    fee=Decimal("0.50"),
+                )
+            worker2.execution.execute_order = mock_execute
+
             pos_id = worker2._state["positions"][0]["id"]
-            result = worker2.close_position_manual(pos_id)
+            result = await worker2.close_position_manual(pos_id)
 
             assert result["status"] == "CLOSED"
             assert Decimal(result["capital"]) == worker2.portfolio.cash
@@ -810,7 +832,8 @@ class TestPortfolioReconstruction:
         finally:
             worker_mod._STATE_FILE = Path("/home/ubuntu/aegis/worker_state.json")
 
-    def test_c5_03_29_no_double_fee_after_restart(self, tmp_path) -> None:
+    @pytest.mark.asyncio
+    async def test_c5_03_29_no_double_fee_after_restart(self, tmp_path) -> None:
         """Closing after restart must not charge entry fee again."""
         import aegis.worker as worker_mod
         worker_mod._STATE_FILE = tmp_path / "worker_state.json"
@@ -825,8 +848,18 @@ class TestPortfolioReconstruction:
             entry_fee = Decimal(worker2._state["positions"][0].get("entry_fee", "0"))
             assert entry_fee == Decimal("0.50")
 
+            async def mock_execute(*args, **kwargs):
+                return OrderResult(
+                    order_id=kwargs.get("order_id", uuid4()),
+                    status=OrderStatus.FILLED,
+                    fill_price=Decimal("60.00"),
+                    fill_quantity=kwargs.get("quantity", Decimal("1")),
+                    fee=Decimal("0.50"),
+                )
+            worker2.execution.execute_order = mock_execute
+
             pos_id = worker2._state["positions"][0]["id"]
-            worker2.close_position_manual(pos_id)
+            await worker2.close_position_manual(pos_id)
 
             # Total fees = entry_fee (0.50) + exit_fee (0.50) = 1.00
             # NOT entry_fee charged twice
@@ -963,7 +996,8 @@ class TestCorrection5Safety:
             loop.close()
         assert result.status == OrderStatus.REJECTED
 
-    def test_close_through_worker_routes_portfolio(self, tmp_path) -> None:
+    @pytest.mark.asyncio
+    async def test_close_through_worker_routes_portfolio(self, tmp_path) -> None:
         """Manual close must route through Portfolio.close_position."""
         import aegis.worker as worker_mod
         worker_mod._STATE_FILE = tmp_path / "worker_state.json"
@@ -1000,9 +1034,19 @@ class TestCorrection5Safety:
             }
             pos_id = worker._state["positions"][0]["id"]
 
+            async def mock_execute(*args, **kwargs):
+                return OrderResult(
+                    order_id=kwargs.get("order_id", uuid4()),
+                    status=OrderStatus.FILLED,
+                    fill_price=Decimal("60.00"),
+                    fill_quantity=kwargs.get("quantity", Decimal("1")),
+                    fee=Decimal("0.50"),
+                )
+            worker.execution.execute_order = mock_execute
+
             cash_before = worker.portfolio.cash
 
-            result = worker.close_position_manual(pos_id)
+            result = await worker.close_position_manual(pos_id)
 
             # Portfolio must have been called (cash changed)
             assert worker.portfolio.cash != cash_before

@@ -373,6 +373,7 @@ Responda com JSON:
             "decisions": [],
             "exposure": "0.00",
             "peak_equity": str(self.capital),
+            "equity": str(self.capital),
             "risk_limits": {
                 "reference_capital": str(self.capital),
                 "max_risk_per_trade_pct": str(self.risk_pct * 100),
@@ -393,16 +394,20 @@ Responda com JSON:
     def state(self) -> dict[str, Any]:
         return self._state.copy()
 
-    def close_position_manual(self, position_id: str) -> dict[str, Any]:
+    async def close_position_manual(self, position_id: str) -> dict[str, Any]:
         """Close a position manually from the dashboard API.
 
-        Routes through RiskEngine.evaluate() then Portfolio.close_position().
+        C7-03: Routes through RiskEngine → ExecutionEngine → Broker → Portfolio.
+        Broker fill_price and fee are used for Portfolio.close_position().
+        If broker rejects SELL (e.g. MercadoBitcoinBroker LIVE), position stays open (fail-closed).
+
         Returns dict with status, realized P&L, and errors.
 
         Pre-existing positions must have current_price stored from the last tick.
         """
         from aegis.ai_engine.decision_engine import DecisionContract
-        from aegis.domain.enums import TradingAction
+        from aegis.domain.enums import TradingAction, OrderSide, OrderStatus
+        from uuid import uuid4
 
         # Find position by ID
         target = None
@@ -426,19 +431,43 @@ Responda com JSON:
         if not close_risk.is_approved:
             return {"status": "REJECTED", "error": "Risk rejected CLOSE", "violations": [v.code for v in close_risk.violations]}
 
-        entry_price = Decimal(target["entry_price"])
-        qty = Decimal(target["quantity"])
         current_price = Decimal(target.get("current_price", target["entry_price"]))
-        entry_fee = Decimal(target.get("entry_fee", "0"))
+        qty = Decimal(target["quantity"])
 
-        # AC-C3-01/02: Exit fee from broker config — use same rate as autonomous CLOSE
-        exit_fee = Decimal("0.50")
+        # C7-03: Execute SELL through ExecutionEngine → Broker
+        order_result = await self.execution.execute_order(
+            order_id=uuid4(),
+            idempotency_key=uuid4(),
+            symbol=symbol,
+            side=OrderSide.SELL,
+            quantity=qty,
+            price=current_price,
+            correlation_id=close_decision.correlation_id,
+            risk_decision=close_risk,
+        )
 
-        # Route through Portfolio (single source of truth)
+        # C7-03: If broker rejected SELL, fail-closed — do not update Portfolio
+        if order_result.status != OrderStatus.FILLED:
+            logger.warning(
+                "Broker rejected SELL for %s: %s (status=%s). Position stays open.",
+                symbol,
+                order_result.error,
+                order_result.status,
+            )
+            return {
+                "status": "BROKER_REJECTED",
+                "error": f"Broker rejected SELL: {order_result.error}",
+                "violations": [v.code for v in close_risk.violations],
+            }
+
+        # C7-03: Only after broker fill, update Portfolio with broker's fill_price and fee
+        fill_price = order_result.fill_price or current_price
+        fill_fee = order_result.fee
+
         realized = self.portfolio.close_position(
             asset=symbol,
-            price=current_price,
-            fee=exit_fee,
+            price=fill_price,
+            fee=fill_fee,
         )
 
         target["status"] = "CLOSED"
@@ -454,9 +483,9 @@ Responda com JSON:
             "side": "LONG",
             "quantity": target["quantity"],
             "entry_price": target["entry_price"],
-            "exit_price": str(current_price),
+            "exit_price": str(fill_price),
             "pnl": str(realized),
-            "fee": str(exit_fee),
+            "fee": str(fill_fee),
         }
         self._state["history"].append(trade)
 
@@ -468,8 +497,9 @@ Responda com JSON:
         self._save_state()
 
         logger.info(
-            "Manual close: %s, realized: R$ %s, capital: R$ %s",
+            "Manual close: %s, fill: R$ %s, realized: R$ %s, capital: R$ %s",
             symbol,
+            fill_price,
             realized,
             self.portfolio.cash,
         )
@@ -486,6 +516,7 @@ Responda com JSON:
         SANDBOX -> SandboxBroker
         LIVE + LIVE_ENABLED=true -> MercadoBitcoinBroker
         LIVE + LIVE_ENABLED=false -> RuntimeError
+        C7-02: Passes configured capital so SandboxBroker balance = Portfolio cash.
         """
         from aegis.execution.factory import create_broker
         from aegis.config import Settings, TradingEnvironment
@@ -502,17 +533,21 @@ Responda com JSON:
             live_api_key=live_api_key,
             live_api_secret=live_api_secret,
         )
-        return create_broker(settings)
+        return create_broker(settings, initial_balance=self.capital)
 
     def _save_state(self) -> None:
         """Persist worker state to JSON file for restart recovery.
         AC-FIN-12: Positions survive restart.
-        AC-C5-03: Portfolio financial state persists across restart."""
+        AC-C5-03: Portfolio financial state persists across restart.
+        C7-01: Portfolio peak_equity persists across restart.
+        C7-04: RiskEngine peak_equity persists across restart."""
         try:
             state_to_save = {
                 "capital": str(self.portfolio.cash),
                 "pnl": str(self.portfolio.total_realized_pnl),
                 "total_fees": str(self.portfolio.total_fees),
+                "peak_equity": str(self.portfolio._peak_equity),
+                "risk_peak_equity": str(self.risk_engine._peak_equity),
                 "positions": self._state["positions"],
                 "orders": self._state["orders"],
                 "history": self._state["history"],
@@ -526,7 +561,9 @@ Responda com JSON:
         """Load persisted state and reconstruct Risk Engine + Portfolio.
         AC-FIN-12: Risk Engine reconstructs positions after restart.
         AC-FIN-13: Restart does not artificially zero positions_count.
-        AC-C5-03: Portfolio reconstructed from persisted financial state."""
+        AC-C5-03: Portfolio reconstructed from persisted financial state.
+        C7-01: Portfolio peak_equity restored from persisted state.
+        C7-04: RiskEngine peak_equity restored from persisted state."""
         if not _STATE_FILE.exists():
             logger.info("No persisted state found, starting fresh")
             return
@@ -546,6 +583,13 @@ Responda com JSON:
             self.portfolio._cash = saved_capital
             self.portfolio._total_realized_pnl = saved_pnl
             self.portfolio._total_fees = saved_fees
+
+            # C7-01: Restore Portfolio peak_equity (backward compat: default to capital)
+            saved_peak_equity = saved.get("peak_equity")
+            if saved_peak_equity is not None:
+                self.portfolio._peak_equity = Decimal(saved_peak_equity)
+            else:
+                self.portfolio._peak_equity = saved_capital
 
             # Reconstruct Portfolio position entries from OPEN positions
             for pos in self._state["positions"]:
@@ -567,6 +611,8 @@ Responda com JSON:
             # Sync state from Portfolio
             self._state["capital"] = str(self.portfolio.cash)
             self._state["pnl"] = str(self.portfolio.total_realized_pnl)
+            # C7-05: Expose equity for dashboard drawdown calculation
+            self._state["equity"] = str(self.portfolio.equity)
 
             # Reconstruct Risk Engine state from persisted OPEN positions
             open_count = sum(1 for p in self._state["positions"] if p.get("status") == "OPEN")
@@ -576,12 +622,21 @@ Responda com JSON:
                 if p.get("status") == "OPEN"
             )
             self.risk_engine.rebuild_from_open_positions(open_count, total_exposure)
+
+            # C7-04: Restore RiskEngine peak_equity (backward compat: default to reference_capital)
+            saved_risk_peak = saved.get("risk_peak_equity")
+            if saved_risk_peak is not None:
+                self.risk_engine._peak_equity = Decimal(saved_risk_peak)
+            else:
+                self.risk_engine._peak_equity = self.risk_engine._limits.reference_capital
+
             logger.info(
-                "State restored: %d open positions, capital R$ %s, P&L R$ %s, exposure R$ %s",
+                "State restored: %d open positions, capital R$ %s, P&L R$ %s, exposure R$ %s, peak_equity R$ %s",
                 open_count,
                 self.portfolio.cash,
                 self.portfolio.total_realized_pnl,
                 total_exposure,
+                self.portfolio._peak_equity,
             )
         except Exception as e:
             logger.error("Failed to load state: %s", e)
@@ -621,6 +676,7 @@ Responda com JSON:
         # Update state from Portfolio (single source of truth, not config)
         self._state["capital"] = str(self.portfolio.cash)
         self._state["pnl"] = str(self.portfolio.total_realized_pnl)
+        self._state["equity"] = str(self.portfolio.equity)
         self._state["risk_limits"] = {
             "reference_capital": str(self.capital),
             "max_risk_per_trade_pct": str(self.risk_pct * 100),
@@ -767,6 +823,8 @@ Responda com JSON:
         self._state["pnl"] = str(self.portfolio.total_realized_pnl)
         self._state["exposure"] = str(self.portfolio.exposure)
         self._state["peak_equity"] = str(self.portfolio._peak_equity)
+        # C7-05: Expose equity for dashboard drawdown calculation
+        self._state["equity"] = str(self.portfolio.equity)
 
         # AC-FIN-12: Persist state for restart recovery
         self._save_state()
@@ -959,8 +1017,9 @@ Responda com JSON:
                 )
 
         elif decision.action == TradingAction.CLOSE:
-            # AC-C3-01: CLOSE routes through Portfolio.close_position()
-            # AC-C3-02: Fee comes from broker config, not hardcoded zero
+            # C7-03: CLOSE routes through ExecutionEngine → Broker → Portfolio.
+            # MercadoBitcoinBroker blocks SELL (V1.0 long-only) → fail-closed in LIVE.
+            # SandboxBroker supports SELL → works correctly in SANDBOX.
             # C6-03: CLOSE must pass through RiskEngine.evaluate() first
             close_decision = DecisionContract(
                 action=TradingAction.CLOSE,
@@ -978,17 +1037,39 @@ Responda com JSON:
 
             for pos in self._state["positions"]:
                 if pos["symbol"] == symbol and pos["status"] == "OPEN":
-                    entry = Decimal(pos["entry_price"])
                     qty = Decimal(pos["quantity"])
 
-                    # Exit fee: same rate as SandboxBroker (0.50 per order)
-                    exit_fee = Decimal("0.50")
+                    # C7-03: Execute SELL through ExecutionEngine → Broker
+                    from aegis.domain.enums import OrderSide
+                    close_order_result = await self.execution.execute_order(
+                        order_id=uuid4(),
+                        idempotency_key=uuid4(),
+                        symbol=symbol,
+                        side=OrderSide.SELL,
+                        quantity=qty,
+                        price=current_price,
+                        correlation_id=close_decision.correlation_id,
+                        risk_decision=close_risk,
+                    )
 
-                    # Route through Portfolio for correct net P&L accounting
+                    # C7-03: If broker rejected SELL, fail-closed — do not update Portfolio
+                    if close_order_result.status != OrderStatus.FILLED:
+                        logger.warning(
+                            "Broker rejected SELL for %s: %s (status=%s). Position stays open.",
+                            symbol,
+                            close_order_result.error,
+                            close_order_result.status,
+                        )
+                        return
+
+                    # C7-03: Only after broker fill, update Portfolio with broker's fill_price and fee
+                    fill_price = close_order_result.fill_price or current_price
+                    fill_fee = close_order_result.fee
+
                     realized = self.portfolio.close_position(
                         asset=symbol,
-                        price=current_price,
-                        fee=exit_fee,
+                        price=fill_price,
+                        fee=fill_fee,
                     )
 
                     pos["status"] = "CLOSED"
@@ -1004,9 +1085,9 @@ Responda com JSON:
                         "side": "LONG",
                         "quantity": pos["quantity"],
                         "entry_price": pos["entry_price"],
-                        "exit_price": str(current_price),
+                        "exit_price": str(fill_price),
                         "pnl": str(realized),
-                        "fee": str(exit_fee),
+                        "fee": str(fill_fee),
                     }
                     self._state["history"].append(trade)
 
@@ -1014,7 +1095,12 @@ Responda com JSON:
                     self.risk_engine.record_position_close()
                     self.risk_engine.record_daily_pnl(realized)
 
-                    logger.info("Position closed: %s, P&L: R$ %s", symbol, realized)
+                    logger.info(
+                        "Position closed: %s, fill: R$ %s, P&L: R$ %s",
+                        symbol,
+                        fill_price,
+                        realized,
+                    )
                     break
 
     def _build_market_state(
