@@ -392,14 +392,48 @@ class TestMBBrokerSellExceedingPositionRejected:
 
 
 # ============================================================
-# C9.1-TEST-11: MercadoBitcoinBroker cannot create SHORT
+# C9.1-TEST-11: SHORT prevention — SELL cannot produce negative position
 # ============================================================
 
 
 class TestMBBrokerNoShort:
 
-    def test_sell_does_not_create_short(self) -> None:
-        """AC-C9.1-11: SELL only closes LONG. No SHORT is created."""
+    def test_sell_does_not_create_negative_position(self) -> None:
+        """AC-C9.1-11: SELL without LONG cannot produce a negative position.
+
+        Unlike C9.1-TEST-09 which verifies rejection, this test proves that
+        the SandboxBroker (used in SANDBOX mode) clamps position quantity
+        to zero and never goes negative — a distinct behavioral invariant.
+        """
+        from aegis.execution.sandbox import SandboxBroker
+
+        broker = SandboxBroker(initial_balance=Decimal("10000.00"))
+
+        # SELL without any prior BUY — position should be zero, not negative
+        submission = OrderSubmission(
+            order_id=uuid4(), idempotency_key=uuid4(),
+            symbol="BTC-BRL", side=OrderSide.SELL,
+            quantity=Decimal("0.001"), price=Decimal("50000.00"),
+            correlation_id=uuid4(),
+        )
+        result = run(broker.submit_order(submission))
+        assert result.status == OrderStatus.REJECTED
+
+        # Position must be >= 0, never negative
+        position = run(broker.get_position("BTC-BRL"))
+        assert position["quantity"] >= Decimal("0")
+
+    def test_trading_action_enum_has_no_short(self) -> None:
+        """TradingAction enum does not contain SHORT — architectural invariant."""
+        from aegis.domain.enums import TradingAction
+        assert not hasattr(TradingAction, "SHORT") or "SHORT" not in [e.name for e in TradingAction]
+
+    def test_order_side_sell_only_closes_long(self) -> None:
+        """OrderSide.SELL in MercadoBitcoinBroker only closes LONG, never opens SHORT.
+
+        Verifies that SELL with available balance=0 is rejected at the broker
+        level, proving that the broker does not treat SELL as an opening operation.
+        """
         from unittest.mock import AsyncMock, MagicMock
         from aegis.execution.mercadobitcoin import MercadoBitcoinBroker, MercadoBitcoinConfig
 
@@ -409,8 +443,6 @@ class TestMBBrokerNoShort:
         broker = MercadoBitcoinBroker(config)
 
         mock_client = AsyncMock()
-
-        # Mock GET → BTC available = 0 (no position)
         balances_response = MagicMock()
         balances_response.status_code = 200
         balances_response.json.return_value = [
@@ -429,9 +461,12 @@ class TestMBBrokerNoShort:
             correlation_id=uuid4(),
         )))
 
-        # Rejected — no SHORT created
+        # SELL is rejected — no SHORT position created
         assert result.status == OrderStatus.REJECTED
+        # POST was never called — no order sent to exchange
         mock_client.post.assert_not_called()
+        # Verify the rejection reason mentions position
+        assert "position" in result.error.lower() or "rejected" in result.error.lower()
 
 
 # ============================================================

@@ -655,9 +655,17 @@ Responda com JSON:
     def _reload_config(self) -> None:
         """Re-read .env.prod and rebuild configuration consistently.
 
-        C9.1-01/02/03: env file → Settings → Worker → RiskEngine.
-        C9.1-04/05/06: initial_capital is NOT overwritten — Portfolio/Broker/P&L unchanged.
-        Settings is the single source of truth for max_positions.
+        C9.1-01/02/03: env file -> Settings -> Worker -> RiskEngine.
+        C9.1-04/05/06: initial_capital is NOT overwritten -- Portfolio/Broker/P&L unchanged.
+        C9.2-02: TRADING_ENVIRONMENT and LIVE_ENABLED are stored in self._settings
+            but do NOT trigger broker recreation. Changing TRADING_ENVIRONMENT
+            requires a full process restart for the broker to be swapped.
+            Hot-reload only propagates max_positions and operational settings.
+        C9.2-06: Settings is reconstructed with only TRADING_ENVIRONMENT,
+            LIVE_ENABLED, and MAX_POSITIONS from env. All other Settings fields
+            use defaults. This is safe because only max_positions is read from
+            the new Settings object. LLM configuration is intentionally
+            restart-only (read via os.getenv at __init__).
         """
         env = _read_env_file()
         if not env:

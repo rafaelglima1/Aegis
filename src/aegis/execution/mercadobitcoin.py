@@ -47,6 +47,15 @@ class MercadoBitcoinBroker(BrokerAdapter):
     Supports: BTC-BRL, ETH-BRL, SOL-BRL, etc.
     Instrument: Spot only (no leverage)
     Direction: Long only
+
+    Position semantics (C9.2-05):
+      get_position() queries the exchange's /api/v4/accounts/balances endpoint
+      and returns the 'available' balance for the asset. This treats the
+      configured exchange account as exclusively controlled by Aegis.
+      Externally deposited assets are therefore considered available inventory.
+      This is intentional for V1.3 where the bot is the sole operator of the
+      account. If external deposits or multi-strategy usage is introduced,
+      local position tracking will be required.
     """
 
     def __init__(self, config: MercadoBitcoinConfig) -> None:
