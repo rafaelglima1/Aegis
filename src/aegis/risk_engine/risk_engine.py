@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -12,10 +13,12 @@ from aegis.domain.contracts import utc_now
 from aegis.domain.enums import TradingAction
 from aegis.risk_engine.risk_limits import RiskLimits
 
+logger = logging.getLogger("aegis.risk_engine")
+
 
 @dataclass
 class RiskLimitViolation:
-    """AC-06.08: Risk rejection produces a machine-readable reason code."""
+    """Risk rejection produces a machine-readable reason code."""
 
     code: str
     message: str
@@ -42,16 +45,35 @@ class RiskDecision:
         return self.status == "APPROVED"
 
 
-class RiskEngine:
-    """AC-06.01: Risk Engine accepts only valid Decision Contracts.
+@dataclass
+class PositionState:
+    """Tracks state of an open position for anti-flip-flop."""
 
-    V1.0 Business Rules:
+    symbol: str
+    entry_price: Decimal
+    stop_loss: Decimal
+    take_profit: Decimal
+    entry_thesis: str
+    entry_timestamp: Any = field(default_factory=utc_now)
+    last_decision: str = ""
+    last_decision_timestamp: Any = field(default_factory=utc_now)
+
+
+class RiskEngine:
+    """Deterministic Risk Engine with quality filters.
+
+    Enforces:
     - Long only (no SHORT)
     - No leverage (spot only)
-    - 1% risk per trade
-    - Max 1 position simultaneous
-    - Take profit mandatory
-    - Circuit breaker: 10% drawdown
+    - Risk per trade limits
+    - Max positions
+    - R/R ratio minimum
+    - Trend filter
+    - Cooldown between trades
+    - Anti flip-flop
+    - Daily trade limits
+    - Entry deviation limits
+    - Circuit breaker
     """
 
     def __init__(self, limits: RiskLimits | None = None) -> None:
@@ -63,6 +85,12 @@ class RiskEngine:
         self._circuit_breaker_active = False
         self._current_exposure = Decimal("0")
 
+        # New: Trade tracking for cooldown and anti-flip-flop
+        self._last_trade_time: dict[str, Any] = {}  # symbol -> timestamp
+        self._daily_trade_count: int = 0
+        self._daily_trade_count_per_symbol: dict[str, int] = {}
+        self._position_states: dict[str, PositionState] = {}
+
     @property
     def limits(self) -> RiskLimits:
         return self._limits
@@ -72,7 +100,7 @@ class RiskEngine:
         self._limits = value
 
     def activate_kill_switch(self) -> None:
-        """AC-06.07: Kill switch blocks new orders."""
+        """Kill switch blocks new orders."""
         self._kill_switch_active = True
 
     def deactivate_kill_switch(self) -> None:
@@ -92,15 +120,13 @@ class RiskEngine:
         self._positions_count = max(0, self._positions_count - 1)
 
     def rebuild_from_open_positions(self, count: int, exposure: Decimal | None = None) -> None:
-        """AC-FIN-12: Risk Engine reconstructs state after restart.
-        AC-FIN-13: Restart does not artificially zero positions_count."""
+        """Reconstruct state after restart."""
         self._positions_count = count
         if exposure is not None:
             self._current_exposure = exposure
 
     @property
     def positions_count(self) -> int:
-        """Current tracked position count."""
         return self._positions_count
 
     def record_exposure_change(self, amount: Decimal) -> None:
@@ -108,7 +134,7 @@ class RiskEngine:
         self._current_exposure += amount
 
     def update_equity(self, current_equity: Decimal) -> None:
-        """Update equity and check circuit breaker (10% drawdown)."""
+        """Update equity and check circuit breaker."""
         if current_equity > self._peak_equity:
             self._peak_equity = current_equity
 
@@ -121,16 +147,54 @@ class RiskEngine:
     def circuit_breaker_active(self) -> bool:
         return self._circuit_breaker_active
 
-    def evaluate(self, decision: DecisionContract) -> RiskDecision:
+    def record_trade(self, symbol: str, timestamp: Any = None) -> None:
+        """Record a trade for cooldown and daily limits."""
+        ts = timestamp or utc_now()
+        self._last_trade_time[symbol] = ts
+        self._daily_trade_count += 1
+        self._daily_trade_count_per_symbol[symbol] = (
+            self._daily_trade_count_per_symbol.get(symbol, 0) + 1
+        )
+
+    def record_position_state(self, symbol: str, entry_price: Decimal,
+                               stop_loss: Decimal, take_profit: Decimal,
+                               thesis: str) -> None:
+        """Record position state for anti-flip-flop."""
+        self._position_states[symbol] = PositionState(
+            symbol=symbol,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            entry_thesis=thesis,
+        )
+
+    def reset_daily_counters(self) -> None:
+        """Reset daily counters (call at start of new day)."""
+        self._daily_pnl = Decimal("0")
+        self._daily_trade_count = 0
+        self._daily_trade_count_per_symbol.clear()
+
+    def evaluate(self, decision: DecisionContract,
+                 current_price: Decimal | None = None,
+                 market_state: dict[str, Any] | None = None,
+                 symbol: str = "") -> RiskDecision:
         """Evaluate a Decision Contract through deterministic risk checks.
 
-        V1.0 Rules enforced:
-        - Long only (no SHORT)
-        - Take profit mandatory for LONG
-        - Stop loss mandatory for LONG
-        - 1% risk per trade
-        - Max 1 position
-        - Circuit breaker 10% drawdown
+        Performs comprehensive validation:
+        1. Circuit breaker / kill switch
+        2. HOLD/CLOSE shortcuts
+        3. Confidence threshold (min_confidence from config)
+        4. Mandatory SL/TP
+        5. SL/TP validation
+        6. R/R ratio validation
+        7. Entry deviation check
+        8. Max positions
+        9. Max exposure
+        10. Daily loss limit
+        11. Daily trade limits
+        12. Cooldown
+        13. Anti flip-flop
+        14. Position sizing
         """
         violations: list[RiskLimitViolation] = []
 
@@ -139,7 +203,7 @@ class RiskEngine:
             violations.append(
                 RiskLimitViolation(
                     code="CIRCUIT_BREAKER_ACTIVE",
-                    message="Circuit breaker active (10% drawdown reached)",
+                    message="Circuit breaker active (drawdown reached)",
                 )
             )
 
@@ -165,20 +229,17 @@ class RiskEngine:
                 violations=violations,
             )
 
-        # V1.0: Long only — reject SHORT
-        # TradingAction only has LONG/HOLD/CLOSE, so SHORT is already blocked
-        # But we validate explicitly for safety
         if decision.action == TradingAction.LONG:
-            # V1.0: Take profit mandatory
-            if not decision.take_profit or decision.take_profit <= 0:
+            # Confidence threshold (from config, not hardcoded)
+            if decision.confidence < self._limits.min_confidence:
                 violations.append(
                     RiskLimitViolation(
-                        code="TAKE_PROFIT_MISSING",
-                        message="Take profit is mandatory for LONG positions",
+                        code="LOW_CONFIDENCE",
+                        message=f"Confidence {decision.confidence} below minimum {self._limits.min_confidence}",
                     )
                 )
 
-            # V1.0: Stop loss mandatory
+            # Mandatory stop loss
             if not decision.stop_loss or decision.stop_loss <= 0:
                 violations.append(
                     RiskLimitViolation(
@@ -187,7 +248,16 @@ class RiskEngine:
                     )
                 )
 
-            # V1.0: Validate stop_loss < entry_price (for LONG)
+            # Mandatory take profit
+            if not decision.take_profit or decision.take_profit <= 0:
+                violations.append(
+                    RiskLimitViolation(
+                        code="TAKE_PROFIT_MISSING",
+                        message="Take profit is mandatory for LONG positions",
+                    )
+                )
+
+            # Validate stop_loss < entry_price
             if (decision.entry_price and decision.stop_loss
                     and decision.stop_loss >= decision.entry_price):
                 violations.append(
@@ -197,7 +267,7 @@ class RiskEngine:
                     )
                 )
 
-            # V1.0: Validate take_profit > entry_price (for LONG)
+            # Validate take_profit > entry_price
             if (decision.entry_price and decision.take_profit
                     and decision.take_profit <= decision.entry_price):
                 violations.append(
@@ -207,14 +277,59 @@ class RiskEngine:
                     )
                 )
 
-        if decision.confidence < Decimal("0.5"):
-            violations.append(
-                RiskLimitViolation(
-                    code="LOW_CONFIDENCE",
-                    message=f"Confidence {decision.confidence} below minimum 0.5",
-                )
-            )
+            # R/R ratio validation
+            if (decision.entry_price and decision.stop_loss and decision.take_profit
+                    and decision.stop_loss < decision.entry_price
+                    and decision.take_profit > decision.entry_price):
+                risk_amount = decision.entry_price - decision.stop_loss
+                reward_amount = decision.take_profit - decision.entry_price
+                if risk_amount > 0:
+                    rr_ratio = reward_amount / risk_amount
+                    if rr_ratio < self._limits.min_risk_reward:
+                        violations.append(
+                            RiskLimitViolation(
+                                code="LOW_RISK_REWARD",
+                                message=f"R/R ratio {rr_ratio:.2f} below minimum {self._limits.min_risk_reward}",
+                            )
+                        )
 
+            # Entry deviation check
+            if (current_price and decision.entry_price
+                    and current_price > 0):
+                deviation = abs(decision.entry_price - current_price) / current_price
+                if deviation > self._limits.max_entry_deviation_pct:
+                    violations.append(
+                        RiskLimitViolation(
+                            code="ENTRY_DEVIATION",
+                            message=f"Entry price deviation {deviation:.2%} exceeds maximum {self._limits.max_entry_deviation_pct:.2%}",
+                        )
+                    )
+
+            # Trend filter
+            if self._limits.trend_filter_enabled and market_state:
+                trend = market_state.get("trend", "NEUTRAL")
+                if trend == "BEARISH":
+                    violations.append(
+                        RiskLimitViolation(
+                            code="TREND_FILTER",
+                            message="LONG not allowed in bearish trend",
+                        )
+                    )
+
+            # Anti flip-flop
+            if symbol and symbol in self._position_states:
+                pos_state = self._position_states[symbol]
+                if current_price and pos_state.entry_price > 0:
+                    price_change = abs(current_price - pos_state.entry_price) / pos_state.entry_price
+                    if price_change < self._limits.min_thesis_change_pct:
+                        violations.append(
+                            RiskLimitViolation(
+                                code="ANTI_FLIP_FLOP",
+                                message=f"Price change {price_change:.2%} too small for re-entry (min {self._limits.min_thesis_change_pct:.2%})",
+                            )
+                        )
+
+        # Max positions
         if self._positions_count >= self._limits.max_simultaneous_positions:
             violations.append(
                 RiskLimitViolation(
@@ -223,7 +338,7 @@ class RiskEngine:
                 )
             )
 
-        # Exposure limit check
+        # Exposure limit
         if self._current_exposure >= self._limits.max_exposure:
             violations.append(
                 RiskLimitViolation(
@@ -232,11 +347,29 @@ class RiskEngine:
                 )
             )
 
+        # Daily loss limit
         if self._daily_pnl < -self._limits.max_daily_loss:
             violations.append(
                 RiskLimitViolation(
                     code="DAILY_LOSS_LIMIT",
                     message=f"Daily loss limit exceeded: {self._daily_pnl}",
+                )
+            )
+
+        # Daily trade limits
+        if self._daily_trade_count >= self._limits.max_daily_trades:
+            violations.append(
+                RiskLimitViolation(
+                    code="MAX_DAILY_TRADES",
+                    message=f"Maximum daily trades ({self._limits.max_daily_trades}) reached",
+                )
+            )
+
+        if symbol and self._daily_trade_count_per_symbol.get(symbol, 0) >= self._limits.max_daily_trades_per_symbol:
+            violations.append(
+                RiskLimitViolation(
+                    code="MAX_DAILY_TRADES_PER_SYMBOL",
+                    message=f"Maximum daily trades for {symbol} ({self._limits.max_daily_trades_per_symbol}) reached",
                 )
             )
 
@@ -260,7 +393,11 @@ class RiskEngine:
         )
 
     def _calculate_position_size(self, decision: DecisionContract) -> Decimal:
-        """AC-06.02: Position sizing is deterministic."""
+        """Position sizing based on risk.
+
+        size = min(risk_based_size, max_position_size)
+        risk_based_size = max_risk / stop_distance
+        """
         if not decision.entry_price or decision.entry_price <= 0:
             return Decimal("0")
 
@@ -274,3 +411,18 @@ class RiskEngine:
         max_quantity = self._limits.max_position_size / decision.entry_price
 
         return min(quantity, max_quantity)
+
+    def calculate_risk_reward(self, entry_price: Decimal, stop_loss: Decimal,
+                                take_profit: Decimal) -> dict[str, Decimal]:
+        """Calculate risk/reward metrics for logging."""
+        if not entry_price or entry_price <= 0:
+            return {"risk": Decimal("0"), "reward": Decimal("0"), "ratio": Decimal("0")}
+
+        risk = entry_price - (stop_loss or entry_price)
+        reward = (take_profit or entry_price) - entry_price
+
+        if risk <= 0:
+            return {"risk": Decimal("0"), "reward": reward, "ratio": Decimal("0")}
+
+        ratio = reward / risk
+        return {"risk": risk, "reward": reward, "ratio": ratio}

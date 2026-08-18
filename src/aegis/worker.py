@@ -754,35 +754,57 @@ Responda com JSON:
             _conf = self.min_confidence * 100
             _daily = self.max_daily_loss_pct * 100
             _pos_sz = self.max_position_size_pct * 100
+            _rr = self.risk_engine.limits.min_risk_reward
 
             template = (
-                "Você é um trader de swing trade de criptomoedas. Analise os dados de mercado e tome uma decisão de trading.\n"
+                "Voce e um trader de swing trade de criptomoedas profissional.\n"
+                "Analise os dados de mercado e tome uma decisao de trading.\n"
                 "\n"
-                "Dados de Mercado:\n"
+                "DADOS DE MERCADO:\n"
                 "{market_state}\n"
                 "\n"
-                "Portfólio Atual:\n"
+                "PORTFOLIO ATUAL:\n"
                 "{portfolio}\n"
                 "\n"
-                "Regras:\n"
-                f"- {direction}\n"
-                f"- Máximo {_max_pos} posição(ões) por vez\n"
-                f"- Risco de {_risk}% por trade\n"
-                f"- Capital de referência: R$ {_cap}\n"
-                f"{_rules}\n"
-                f"- Só opera se confiança >= {_conf}%\n"
-                f"- Perda diária máxima: {_daily}% do capital\n"
-                f"- Tamanho máximo de posição: {_pos_sz}% do capital\n"
+                "REGRAS OBRIGATORIAS (validadas pelo codigo):\n"
+                f"- Apenas LONG (sem SHORT)\n"
+                f"- Maximo {_max_pos} posicao(oes) aberta(s)\n"
+                f"- Stop loss OBRIGATORIO e VALIDO (abaixo do entry)\n"
+                f"- Take profit OBRIGATORIO e VALIDO (acima do entry)\n"
+                f"- R/R minimo de {_rr} (reward/risk >= {_rr})\n"
+                f"- Risk por trade: {_risk}% do capital (R$ {_cap})\n"
+                f"- Tamanho maximo: {_pos_sz}% do capital\n"
+                f"- Confidence minima: {_conf}%\n"
+                f"- Perda diaria maxima: {_daily}%\n"
+                "\n"
+                "FILTROS OBRIGATORIOS:\n"
+                "- NAO entre LONG contra tendencia BEARISH (preco < SMA20 < SMA50)\n"
+                "- NAO entre LONG se R/R < 1.5\n"
+                "- NAO entre LONG se confidence < 50%\n"
+                "- NAO entre LONG sem stop loss VALIDO\n"
+                "- NAO entre LONG sem take profit VALIDO\n"
+                "- NAO feche posicao por ruido de curto prazo\n"
+                "- NAO faca flip-flop (LONG -> CLOSE -> LONG imediato)\n"
+                "- Considere a tendencia, momentum, volume e RSI\n"
+                "- Prefira HOLD a operacao ruim\n"
+                "- PRESERVE CAPITAL: e melhor nao operar do que operar mal\n"
+                "\n"
+                "ANALISE TECNICA:\n"
+                "- Verifique SMA20 vs SMA50 (tendencia)\n"
+                "- Verifique RSI (sobrecomprado >70, sobrevendido <30)\n"
+                "- Verifique momentum (ultimos candles)\n"
+                "- Verifique volume (confirmacao)\n"
+                "- Calcule R/R REAL antes de sugerir entry/stop/take_profit\n"
                 "\n"
                 "Responda com JSON:\n"
                 "{{\n"
                 '    "action": "LONG" ou "HOLD" ou "CLOSE",\n'
                 '    "confidence": 0.0 a 1.0,\n'
-                '    "thesis": "raciocínio breve",\n'
-                '    "entry_price": número ou null,\n'
-                '    "stop_loss": número ou null,\n'
-                '    "take_profit": número ou null,\n'
-                '    "reasoning": "análise detalhada"\n'
+                '    "thesis": "raciocinio breve e justificativa",\n'
+                '    "entry_price": numero ou null,\n'
+                '    "stop_loss": numero ou null,\n'
+                '    "take_profit": numero ou null,\n'
+                '    "reasoning": "analise tecnica detalhada com R/R"\n'
                 "}}"
             )
 
@@ -896,7 +918,7 @@ Responda com JSON:
             pos["pnl_pct"] = str((unrealized / (entry * qty) * 100) if entry > 0 and qty > 0 else 0)
 
     async def _process_symbol(self, symbol: str) -> None:
-        """Process a single trading symbol."""
+        """Process a single trading symbol with deterministic risk validation."""
         logger.info("Processing %s...", symbol)
 
         # 1. Fetch candles
@@ -917,12 +939,15 @@ Responda com JSON:
         if symbol in self.portfolio._positions and self.portfolio._positions[symbol].quantity > 0:
             self.portfolio.update_prices({symbol: current_price})
 
+        # Position monitoring: check SL/TP for open positions
+        await self._monitor_position(symbol, current_price)
+
         # Sync current_price from Portfolio to state (UI/API representation)
         for pos in self._state["positions"]:
             if pos["symbol"] == symbol and pos["status"] == "OPEN":
                 pos["current_price"] = str(current_price)
 
-        # 3. Build market state
+        # 3. Build market state with enhanced indicators
         market_state = self._build_market_state(symbol, candles, current_price)
 
         # 4. Send to LLM
@@ -975,8 +1000,13 @@ Responda com JSON:
             decision.confidence,
         )
 
-        # 6. Risk evaluation
-        risk_result = self.risk_engine.evaluate(decision)
+        # 6. Risk evaluation with current price and market state
+        risk_result = self.risk_engine.evaluate(
+            decision,
+            current_price=current_price,
+            market_state=market_state,
+            symbol=symbol,
+        )
 
         if not risk_result.is_approved:
             logger.info(
@@ -1025,10 +1055,24 @@ Responda com JSON:
                     "pnl_pct": str((pnl / (entry * risk_result.approved_quantity) * 100) if entry > 0 else 0),
                     "stop_loss": str(decision.stop_loss) if decision.stop_loss else None,
                     "take_profit": str(decision.take_profit) if decision.take_profit else None,
+                    "thesis": decision.thesis,
                     "status": "OPEN",
                     "opened_at": datetime.now(timezone.utc).isoformat(),
                 }
                 self._state["positions"].append(position)
+
+                # Record position state for anti-flip-flop
+                if decision.stop_loss and decision.take_profit:
+                    self.risk_engine.record_position_state(
+                        symbol=symbol,
+                        entry_price=entry,
+                        stop_loss=decision.stop_loss,
+                        take_profit=decision.take_profit,
+                        thesis=decision.thesis,
+                    )
+
+                # Record trade for cooldown and daily limits
+                self.risk_engine.record_trade(symbol)
 
                 # Record order
                 order_record = {
@@ -1143,18 +1187,58 @@ Responda com JSON:
                     )
                     break
 
+    async def _monitor_position(self, symbol: str, current_price: Decimal) -> None:
+        """Monitor open position for SL/TP hit.
+
+        Checks if current price has hit stop loss or take profit.
+        If hit, triggers automatic CLOSE through the canonical pipeline.
+        """
+        for pos in self._state["positions"]:
+            if pos["symbol"] == symbol and pos["status"] == "OPEN":
+                entry_price = Decimal(pos.get("entry_price", "0"))
+                stop_loss = Decimal(pos["stop_loss"]) if pos.get("stop_loss") else None
+                take_profit = Decimal(pos["take_profit"]) if pos.get("take_profit") else None
+
+                # Check stop loss hit (price dropped below stop)
+                if stop_loss and current_price <= stop_loss:
+                    logger.info(
+                        "STOP LOSS hit for %s: price=%s <= stop=%s",
+                        symbol, current_price, stop_loss,
+                    )
+                    await self._close_position_by_id(pos["id"], "STOP_LOSS")
+                    return
+
+                # Check take profit hit (price rose above target)
+                if take_profit and current_price >= take_profit:
+                    logger.info(
+                        "TAKE PROFIT hit for %s: price=%s >= target=%s",
+                        symbol, current_price, take_profit,
+                    )
+                    await self._close_position_by_id(pos["id"], "TAKE_PROFIT")
+                    return
+
+    async def _close_position_by_id(self, position_id: str, reason: str) -> None:
+        """Close a position by ID with reason logging."""
+        result = await self.close_position_manual(position_id)
+        if result.get("status") == "CLOSED":
+            logger.info("Auto-closed position %s: reason=%s, PnL=%s",
+                       position_id, reason, result.get("pnl", "0"))
+        else:
+            logger.warning("Failed to auto-close position %s: %s", position_id, result)
+
     def _build_market_state(
         self, symbol: str, candles: list[dict], current_price: Decimal
     ) -> dict[str, Any]:
-        """Build market state from candles."""
+        """Build enhanced market state with technical indicators."""
         if not candles:
             return {"symbol": symbol, "current_price": str(current_price)}
 
-        # Calculate indicators from candles
         closes = [Decimal(str(c.get("close", "0"))) for c in candles if c.get("close")]
         volumes = [Decimal(str(c.get("volume", "0"))) for c in candles if c.get("volume")]
+        highs = [Decimal(str(c.get("high", "0"))) for c in candles if c.get("high")]
+        lows = [Decimal(str(c.get("low", "0"))) for c in candles if c.get("low")]
 
-        # Simple moving averages
+        # Moving averages
         sma_20 = sum(closes[-20:]) / min(20, len(closes)) if closes else Decimal("0")
         sma_50 = sum(closes[-50:]) / min(50, len(closes)) if closes else Decimal("0")
 
@@ -1165,8 +1249,40 @@ Responda com JSON:
         else:
             volatility = Decimal("0")
 
-        # Trend
+        # Trend classification
         trend = "BULLISH" if current_price > sma_20 > sma_50 else "BEARISH" if current_price < sma_20 < sma_50 else "NEUTRAL"
+
+        # RSI (14-period)
+        rsi = self._calculate_rsi(closes, 14)
+
+        # Momentum (rate of change over last 10 candles)
+        momentum = Decimal("0")
+        if len(closes) >= 10:
+            momentum = (closes[-1] - closes[-10]) / closes[-10] * Decimal("100")
+
+        # Volume trend (compare recent vs average)
+        volume_trend = "NORMAL"
+        if len(volumes) >= 20:
+            avg_vol = sum(volumes[-20:]) / Decimal("20")
+            recent_vol = sum(volumes[-5:]) / Decimal("5") if len(volumes) >= 5 else avg_vol
+            if avg_vol > 0:
+                vol_ratio = recent_vol / avg_vol
+                if vol_ratio > Decimal("1.5"):
+                    volume_trend = "HIGH"
+                elif vol_ratio < Decimal("0.5"):
+                    volume_trend = "LOW"
+
+        # Price position relative to range
+        price_position = "MIDDLE"
+        if highs and lows:
+            period_high = max(highs[-20:]) if len(highs) >= 20 else max(highs)
+            period_low = min(lows[-20:]) if len(lows) >= 20 else min(lows)
+            if period_high > period_low:
+                pct = (current_price - period_low) / (period_high - period_low)
+                if pct > Decimal("0.8"):
+                    price_position = "HIGH"
+                elif pct < Decimal("0.2"):
+                    price_position = "LOW"
 
         return {
             "symbol": symbol,
@@ -1175,10 +1291,40 @@ Responda com JSON:
             "sma_50": str(sma_50),
             "volatility": str(volatility),
             "trend": trend,
+            "rsi": str(rsi),
+            "momentum": str(momentum),
+            "volume_trend": volume_trend,
+            "price_position": price_position,
             "volume_24h": str(sum(volumes[-24:])) if volumes else "0",
             "candles_count": len(candles),
             "last_5_closes": [str(c) for c in closes[-5:]],
         }
+
+    def _calculate_rsi(self, closes: list[Decimal], period: int = 14) -> Decimal:
+        """Calculate RSI (Relative Strength Index)."""
+        if len(closes) < period + 1:
+            return Decimal("50")  # Default neutral
+
+        gains = []
+        losses = []
+        for i in range(1, len(closes)):
+            change = closes[i] - closes[i-1]
+            if change > 0:
+                gains.append(change)
+                losses.append(Decimal("0"))
+            else:
+                gains.append(Decimal("0"))
+                losses.append(abs(change))
+
+        avg_gain = sum(gains[-period:]) / Decimal(period)
+        avg_loss = sum(losses[-period:]) / Decimal(period)
+
+        if avg_loss == 0:
+            return Decimal("100")
+
+        rs = avg_gain / avg_loss
+        rsi = Decimal("100") - (Decimal("100") / (Decimal("1") + rs))
+        return rsi
 
 
 # Singleton

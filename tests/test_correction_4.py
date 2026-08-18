@@ -467,7 +467,7 @@ class TestReplayRiskConfiguration:
                     thesis="Buy",
                     entry_price=candle.close,
                     stop_loss=Decimal("90"),
-                    take_profit=Decimal("120"),
+                    take_profit=Decimal("130"),  # R/R = (130-105)/(105-90) = 1.67 >= 1.5
                 )
 
         loop = asyncio.new_event_loop()
