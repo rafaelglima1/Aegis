@@ -101,7 +101,11 @@ class TestRealReloadUpdatesSettings:
 class TestRealReloadUpdatesRiskEngine:
 
     def test_reload_updates_risk_engine(self, tmp_path: Path) -> None:
-        """AC-C9.1-03: Settings, Worker, and RiskEngine stay synchronized."""
+        """AC-C9.1-03: Settings, Worker, and RiskEngine stay synchronized.
+
+        AC-C10-07: RiskEngine clamps to MAX_POSITIONS_HARD_LIMIT=1.
+        """
+        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
         worker = _make_worker(tmp_path, max_positions="1")
         assert worker.risk_engine.limits.max_simultaneous_positions == 1
 
@@ -110,7 +114,7 @@ class TestRealReloadUpdatesRiskEngine:
 
         assert worker.max_positions == 7
         assert worker._settings.max_positions == 7
-        assert worker.risk_engine.limits.max_simultaneous_positions == 7
+        assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
 
 
 # ============================================================

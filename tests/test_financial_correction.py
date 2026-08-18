@@ -111,11 +111,16 @@ class TestMaxPositionsSingleSource:
         assert "MAX_POSITIONS" in violation_codes
 
     def test_no_hardcoded_max_positions_in_risk(self) -> None:
-        """AC-FIN-04: max_positions must come from RiskLimits, not be hardcoded."""
-        # RiskLimits with max=3 → RiskEngine should respect it
+        """AC-FIN-04: max_positions must come from RiskLimits, not be hardcoded.
+
+        AC-C10-07: RiskLimits clamps to MAX_POSITIONS_HARD_LIMIT=1.
+        """
+        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
+        # RiskLimits with max=3 gets clamped to hard limit of 1
         risk = RiskEngine(RiskLimits(max_simultaneous_positions=3))
-        for _ in range(2):
-            risk.record_position_open()
+        assert risk.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
+
+        # 0 positions -> approved
         decision = DecisionContract(
             action=TradingAction.LONG,
             confidence=Decimal("0.85"),
@@ -126,6 +131,11 @@ class TestMaxPositionsSingleSource:
         )
         result = risk.evaluate(decision)
         assert result.is_approved
+
+        # 1 position -> rejected (hard limit)
+        risk.record_position_open()
+        result = risk.evaluate(decision)
+        assert not result.is_approved
 
 
 # ============================================================

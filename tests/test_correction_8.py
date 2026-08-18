@@ -164,23 +164,25 @@ class TestRiskCapitalFromSettings:
 
 
 class TestRiskMaxPositionsFromSettings:
-    """AC-C8-07: RiskLimits.max_simultaneous_positions == Settings.max_positions."""
+    """AC-C8-07: RiskLimits.max_simultaneous_positions == Settings.max_positions (clamped by hard limit)."""
 
     def test_risk_max_positions_from_settings(self) -> None:
-        """RiskEngine receives max_simultaneous_positions from Settings."""
+        """RiskEngine receives max_simultaneous_positions from Settings, clamped to hard limit."""
         from aegis.worker import AutonomousWorker
+        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
 
         settings = Settings(max_positions=3)
         worker = AutonomousWorker(settings=settings)
-        assert worker.risk_engine.limits.max_simultaneous_positions == 3
+        assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
 
     def test_risk_max_positions_matches_settings(self) -> None:
-        """RiskLimits.max_simultaneous_positions == Settings.max_positions."""
+        """RiskLimits.max_simultaneous_positions is clamped to hard limit."""
         from aegis.worker import AutonomousWorker
+        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
 
         settings = Settings(max_positions=5)
         worker = AutonomousWorker(settings=settings)
-        assert worker.risk_engine.limits.max_simultaneous_positions == settings.max_positions
+        assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
 
 
 # ============================================================
@@ -288,25 +290,27 @@ class TestDefaultMaxPositionsPropagation:
 
 
 class TestNonDefaultMaxPositionsPropagation:
-    """AC-C8-12: max_positions = 3 propagates."""
+    """AC-C8-12: max_positions propagates, but is clamped by hard limit."""
 
     def test_max_positions_3(self) -> None:
-        """Settings(3) -> Worker -> Risk all = 3."""
+        """Settings(3) -> Worker = 3, Risk = clamped to hard limit."""
         from aegis.worker import AutonomousWorker
+        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
 
         settings = Settings(max_positions=3)
         worker = AutonomousWorker(settings=settings)
         assert worker.max_positions == 3
-        assert worker.risk_engine.limits.max_simultaneous_positions == 3
+        assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
 
     def test_max_positions_5(self) -> None:
-        """Settings(5) -> Worker -> Risk all = 5."""
+        """Settings(5) -> Worker = 5, Risk = clamped to hard limit."""
         from aegis.worker import AutonomousWorker
+        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
 
         settings = Settings(max_positions=5)
         worker = AutonomousWorker(settings=settings)
         assert worker.max_positions == 5
-        assert worker.risk_engine.limits.max_simultaneous_positions == 5
+        assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
 
 
 # ============================================================

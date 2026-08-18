@@ -199,12 +199,20 @@ class TestPipelineCapitalSemHardcode:
 class TestMaxPositionsSemDrift:
 
     def test_risk_engine_uses_config(self) -> None:
+        """AC-C10-07: RiskLimits clamps to MAX_POSITIONS_HARD_LIMIT=1."""
+        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
         risk = RiskEngine(RiskLimits(max_simultaneous_positions=3))
-        for _ in range(2):
-            risk.record_position_open()
+        assert risk.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
+
+        # 0 positions -> approved
         decision = DecisionContract(action=TradingAction.LONG, confidence=Decimal("0.85"), thesis="test", entry_price=Decimal("50000"), stop_loss=Decimal("48000"), take_profit=Decimal("55000"))
         result = risk.evaluate(decision)
         assert result.is_approved
+
+        # 1 position -> rejected (hard limit)
+        risk.record_position_open()
+        result = risk.evaluate(decision)
+        assert not result.is_approved
 
     def test_worker_uses_config(self) -> None:
         import os
@@ -232,13 +240,21 @@ class TestMaxPositionsSemDrift:
         assert broker._config.max_positions == 3
 
     def test_propagation_max_positions_3(self) -> None:
+        """AC-C10-07: RiskLimits clamps to MAX_POSITIONS_HARD_LIMIT=1."""
+        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
         settings = Settings(max_positions=3)
         risk = RiskEngine(RiskLimits(max_simultaneous_positions=settings.max_positions))
-        for _ in range(2):
-            risk.record_position_open()
+        assert risk.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
+
+        # 0 positions -> approved
         decision = DecisionContract(action=TradingAction.LONG, confidence=Decimal("0.85"), thesis="test", entry_price=Decimal("50000"), stop_loss=Decimal("48000"), take_profit=Decimal("55000"))
         result = risk.evaluate(decision)
         assert result.is_approved
+
+        # 1 position -> rejected (hard limit)
+        risk.record_position_open()
+        result = risk.evaluate(decision)
+        assert not result.is_approved
 
 
 # ============================================================

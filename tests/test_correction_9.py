@@ -176,9 +176,13 @@ class TestSellBehindRiskGate:
 class TestHotReloadMaxPositions:
 
     def test_max_positions_propagates_to_risk_engine(self, tmp_path: Path) -> None:
-        """C9-06: Real _reload_config propagates max_positions through Settings."""
+        """C9-06: Real _reload_config propagates max_positions through Settings.
+
+        AC-C10-07: RiskEngine clamps to MAX_POSITIONS_HARD_LIMIT=1.
+        """
         from aegis.config import Settings
         from aegis.worker import AutonomousWorker
+        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
         import aegis.worker as worker_mod
 
         # Write temp env file
@@ -195,7 +199,7 @@ class TestHotReloadMaxPositions:
         worker._reload_config()
 
         assert worker.max_positions == 3
-        assert worker.risk_engine.limits.max_simultaneous_positions == 3
+        assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
         assert worker._settings.max_positions == 3
 
 

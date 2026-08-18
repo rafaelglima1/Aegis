@@ -437,7 +437,7 @@ class TestReplayRiskConfiguration:
         )
         assert engine._risk_limits is not None
         assert engine._risk_limits.reference_capital == Decimal("200.00")
-        assert engine._risk_limits.max_simultaneous_positions == 3
+        assert engine._risk_limits.max_simultaneous_positions == 1  # Clamped by hard limit
 
     def test_replay_max_positions_respected(self) -> None:
         """Replay with custom max_positions must reject when limit exceeded."""

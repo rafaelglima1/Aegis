@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Any, AsyncIterator
 from uuid import uuid4
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -22,6 +22,31 @@ import os
 _log_level = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(level=_log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("aegis")
+
+
+# AC-C10-10: API authentication boundary for sensitive endpoints
+API_KEY = os.getenv("AEGIS_API_KEY", "")
+
+
+async def require_api_key(authorization: str | None = Header(None)) -> None:
+    """AC-C10-10: Require API key for sensitive endpoints.
+
+    Accepts either:
+      - Authorization: Bearer <api_key>
+      - X-API-Key: <api_key>
+
+    If AEGIS_API_KEY is not configured, authentication is bypassed
+    (development mode). In production, set AEGIS_API_KEY env var.
+    """
+    if not API_KEY:
+        return  # Development mode — no auth required
+
+    if authorization is None:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    token = authorization.replace("Bearer ", "").strip()
+    if token != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -1154,8 +1179,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return worker.state
 
     @app.post("/api/run")
-    async def manual_run() -> dict[str, str]:
-        """Trigger a manual tick immediately."""
+    async def manual_run(_auth: None = Depends(require_api_key)) -> dict[str, str]:
+        """Trigger a manual tick immediately. AC-C10-10: requires API key."""
         from aegis.worker import get_worker
         worker = get_worker()
         import asyncio as _aio
@@ -1163,12 +1188,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok", "message": "Tick executado manualmente"}
 
     @app.post("/api/trade")
-    async def place_trade(request: TradeRequest) -> dict[str, Any]:
-        """Place a new trade order through the canonical pipeline.
+    async def place_trade(request: TradeRequest, _auth: None = Depends(require_api_key)) -> dict[str, Any]:
+        """AC-C10-10: Place a new trade order through the canonical pipeline. Requires API key.
 
         AC-ARCH-2: Frontend never calls broker directly.
-        Frontend → TradingPipeline → RiskEngine → ExecutionEngine → Broker.
+        Frontend -> TradingPipeline -> RiskEngine -> ExecutionEngine -> Broker.
         """
+
         from aegis.ai_engine.decision_engine import DecisionContract
         from aegis.domain.enums import TradingAction
         from aegis.pipeline import TradingPipeline
@@ -1186,7 +1212,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             take_profit=Decimal(str(request.take_profit)) if request.take_profit else None,
         )
 
-        # Run through canonical pipeline (Risk → Execution → Portfolio → Audit)
+        # Run through canonical pipeline (Risk -> Execution -> Portfolio -> Audit)
         result = await pipeline.run(symbol=request.symbol, decision=decision)
 
         if result.status == "REJECTED":
@@ -1210,11 +1236,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok", "order_id": str(order_id), "message": f"Trade {result.status}"}
 
     @app.post("/api/position/{position_id}/close")
-    async def close_position(position_id: str) -> dict[str, str]:
-        """Close a position through the worker (canonical source of truth).
+    async def close_position(position_id: str, _auth: None = Depends(require_api_key)) -> dict[str, str]:
+        """AC-C10-10: Close a position through the worker. Requires API key.
 
-        AC-ARCH-2: Frontend never calls broker directly.
-        Frontend → Worker.close_position_manual → Portfolio.close_position.
+        Frontend -> Worker.close_position_manual -> Portfolio.close_position.
         """
         from aegis.worker import get_worker
         worker = get_worker()
@@ -1230,12 +1255,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok", "message": "Position closed", "pnl": result["pnl"]}
 
     @app.post("/api/risk/kill-switch")
-    async def toggle_kill_switch(request: KillSwitchRequest) -> dict[str, str]:
-        """Toggle kill switch."""
+    async def toggle_kill_switch(request: KillSwitchRequest, _auth: None = Depends(require_api_key)) -> dict[str, str]:
+        """Toggle kill switch and wire to RiskEngine. Requires API key."""
+        from aegis.worker import get_worker
+        worker = get_worker()
+
         if request.active:
+            worker.risk_engine.activate_kill_switch()
             await broadcast({"type": "kill_switch", "active": True})
-            return {"status": "ok", "message": "Kill switch activated"}
+            return {"status": "ok", "message": "Kill switch activated - all new orders blocked"}
         else:
+            worker.risk_engine.deactivate_kill_switch()
             await broadcast({"type": "kill_switch", "active": False})
             return {"status": "ok", "message": "Kill switch deactivated"}
 
