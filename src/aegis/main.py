@@ -24,21 +24,34 @@ logging.basicConfig(level=_log_level, format="%(asctime)s %(name)s %(levelname)s
 logger = logging.getLogger("aegis")
 
 
-# AC-C10-10: API authentication boundary for sensitive endpoints
+# AC-C10.1-11: API authentication boundary for sensitive endpoints.
+# Production: AEGIS_API_KEY MUST be set. Missing key = fail-closed.
+# Development: AEGIS_API_KEY not set = endpoints open (explicit opt-in).
 API_KEY = os.getenv("AEGIS_API_KEY", "")
+_ENVIRONMENT = os.getenv("TRADING_ENVIRONMENT", "SANDBOX")
 
 
 async def require_api_key(authorization: str | None = Header(None)) -> None:
-    """AC-C10-10: Require API key for sensitive endpoints.
+    """AC-C10.1-11/12: Require API key for sensitive endpoints.
 
-    Accepts either:
-      - Authorization: Bearer <api_key>
-      - X-API-Key: <api_key>
+    Accepts:
+      Authorization: Bearer <api_key>
 
-    If AEGIS_API_KEY is not configured, authentication is bypassed
-    (development mode). In production, set AEGIS_API_KEY env var.
+    Production behavior (TRADING_ENVIRONMENT=LIVE):
+      - AEGIS_API_KEY must be set
+      - Missing key = 401 Unauthorized (fail-closed)
+      - Invalid key = 403 Forbidden
+
+    Development behavior (TRADING_ENVIRONMENT=SANDBOX):
+      - AEGIS_API_KEY not set = bypass (development mode)
+      - AEGIS_API_KEY set = enforced
     """
     if not API_KEY:
+        if _ENVIRONMENT == "LIVE":
+            raise HTTPException(
+                status_code=503,
+                detail="AEGIS_API_KEY not configured. LIVE environment requires API key authentication.",
+            )
         return  # Development mode — no auth required
 
     if authorization is None:

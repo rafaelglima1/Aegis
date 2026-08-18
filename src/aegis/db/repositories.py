@@ -96,6 +96,23 @@ class PositionRepository:
         await self._session.flush()
         return await self.get_by_id(position_id)
 
+    async def update_price(self, position_id: UUID, current_price: Decimal) -> PositionModel | None:
+        """Update current price for unrealized P&L calculation."""
+        await self._session.execute(
+            update(PositionModel)
+            .where(PositionModel.position_id == position_id)
+            .values(current_price=current_price)
+        )
+        await self._session.flush()
+        return await self.get_by_id(position_id)
+
+    async def list_open(self) -> list[PositionModel]:
+        """List all open positions."""
+        result = await self._session.execute(
+            select(PositionModel).where(PositionModel.status == PositionStatus.OPEN.value)
+        )
+        return list(result.scalars().all())
+
 
 class FillRepository:
     """Repository for fill persistence operations."""
