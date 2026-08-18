@@ -50,6 +50,16 @@ class RiskLimits:
     fee_rate: Decimal = Decimal("0.005")  # 0.5% fee rate
     slippage_bps: Decimal = Decimal("10")  # 10 basis points slippage
 
+    # Setup scoring
+    setup_score_min: int = 50  # Minimum setup score for LONG
+    setup_score_strong: int = 65  # Strong setup threshold
+    setup_score_very_strong: int = 80  # Very strong setup threshold
+
+    # Daily loss escalation
+    daily_loss_warn_pct: Decimal = Decimal("0.03")  # 3% - reduce exposure
+    daily_loss_strong_pct: Decimal = Decimal("0.04")  # 4% - only strong setups
+    daily_loss_block_pct: Decimal = Decimal("0.05")  # 5% - block new entries
+
     def __post_init__(self) -> None:
         """Enforce hard limits at construction time."""
         if self.max_simultaneous_positions > MAX_POSITIONS_HARD_LIMIT:

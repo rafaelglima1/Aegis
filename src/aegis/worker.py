@@ -20,6 +20,9 @@ from aegis.ai_engine.prompt_manager import PromptManager, PromptVersion
 from aegis.domain.enums import TradingAction, PositionSide
 from aegis.risk_engine.risk_engine import RiskEngine
 from aegis.risk_engine.risk_limits import RiskLimits
+from aegis.risk_engine.setup_scorer import SetupScorer, SetupWeights
+from aegis.risk_engine.position_manager import PositionManager, PositionManagerConfig
+from aegis.risk_engine.trade_journal import TradeJournal, TradeRecord
 from aegis.execution.engine import ExecutionEngine
 from aegis.portfolio.portfolio import Portfolio
 from aegis.audit import AuditLogger
@@ -342,6 +345,11 @@ class AutonomousWorker:
         # AC-FIN-02: Portfolio starts with configured capital
         self.portfolio = Portfolio(initial_cash=self.capital)
         self.audit = AuditLogger()
+
+        # New: Setup scorer, position manager, trade journal
+        self.setup_scorer = SetupScorer()
+        self.position_manager = PositionManager()
+        self.trade_journal = TradeJournal()
 
         # Register default prompt (will be rebuilt dynamically by _reload_config)
         self.prompt_manager.register(
@@ -795,6 +803,9 @@ Responda com JSON:
                 "- Verifique momentum (ultimos candles)\n"
                 "- Verifique volume (confirmacao)\n"
                 "- Calcule R/R REAL antes de sugerir entry/stop/take_profit\n"
+                "- Considere o setup_score e market_regime nos dados de mercado\n"
+                "- Para LONG, prefira regime BULL/STRONG_BULL com score >= 65\n"
+                "- NAO entre LONG em regime BEAR/STRONG_BEAR\n"
                 "\n"
                 "Responda com JSON:\n"
                 "{{\n"
@@ -950,17 +961,27 @@ Responda com JSON:
         # 3. Build market state with enhanced indicators
         market_state = self._build_market_state(symbol, candles, current_price)
 
-        # 4. Send to LLM
+        # 3b. Calculate setup score (deterministic)
+        pre_setup = self.setup_scorer.score(market_state)
+
+        # 4. Send to LLM with setup data
         portfolio_state = {
             "capital": str(self._state["capital"]),
             "positions": self._state["positions"],
             "pnl": str(self._state["pnl"]),
         }
 
+        # Enrich market state with setup data for LLM
+        enriched_state = {
+            **market_state,
+            "setup_score": pre_setup.score,
+            "market_regime": pre_setup.market_regime,
+        }
+
         prompt = self.prompt_manager.render(
             "trading_v1",
             {
-                "market_state": json.dumps(market_state, indent=2, default=str),
+                "market_state": json.dumps(enriched_state, indent=2, default=str),
                 "portfolio": json.dumps(portfolio_state, indent=2, default=str),
             },
         )
@@ -980,12 +1001,29 @@ Responda com JSON:
             model=self.llm_model,
         )
 
-        # Record decision
+        # 5b. Calculate setup score (deterministic, before risk evaluation)
+        decision_rr = None
+        if decision.entry_price and decision.stop_loss and decision.take_profit:
+            if decision.stop_loss < decision.entry_price and decision.take_profit > decision.entry_price:
+                risk_amount = decision.entry_price - decision.stop_loss
+                reward_amount = decision.take_profit - decision.entry_price
+                if risk_amount > 0:
+                    decision_rr = reward_amount / risk_amount
+
+        setup_result = self.setup_scorer.score(market_state, decision_rr)
+        setup_score = setup_result.score
+
+        # Record decision with setup data
         decision_record = {
             "symbol": symbol,
             "action": decision.action.value,
             "confidence": float(decision.confidence),
             "thesis": decision.thesis,
+            "setup_score": setup_score,
+            "market_regime": setup_result.market_regime,
+            "rsi": market_state.get("rsi", "0"),
+            "momentum": market_state.get("momentum", "0"),
+            "trend": market_state.get("trend", "NEUTRAL"),
             "provider": decision.provider,
             "model": decision.model,
             "reasoning": decision.reasoning,
@@ -994,18 +1032,21 @@ Responda com JSON:
         self._state["decisions"].append(decision_record)
 
         logger.info(
-            "Decision for %s: %s (confidence: %s)",
+            "Decision for %s: %s (confidence: %s, setup_score: %d, regime: %s)",
             symbol,
             decision.action.value,
             decision.confidence,
+            setup_score,
+            setup_result.market_regime,
         )
 
-        # 6. Risk evaluation with current price and market state
+        # 6. Risk evaluation with setup score
         risk_result = self.risk_engine.evaluate(
             decision,
             current_price=current_price,
             market_state=market_state,
             symbol=symbol,
+            setup_score=setup_score,
         )
 
         if not risk_result.is_approved:
@@ -1069,6 +1110,16 @@ Responda com JSON:
                         stop_loss=decision.stop_loss,
                         take_profit=decision.take_profit,
                         thesis=decision.thesis,
+                    )
+
+                # Register with position manager for BE/trailing/profit protection
+                if decision.stop_loss and decision.take_profit:
+                    self.position_manager.register_position(
+                        symbol=symbol,
+                        entry_price=entry,
+                        stop_loss=decision.stop_loss,
+                        take_profit=decision.take_profit,
+                        quantity=risk_result.approved_quantity,
                     )
 
                 # Record trade for cooldown and daily limits
@@ -1188,10 +1239,12 @@ Responda com JSON:
                     break
 
     async def _monitor_position(self, symbol: str, current_price: Decimal) -> None:
-        """Monitor open position for SL/TP hit.
+        """Monitor open position for SL/TP hit and adaptive SL adjustments.
 
-        Checks if current price has hit stop loss or take profit.
-        If hit, triggers automatic CLOSE through the canonical pipeline.
+        Checks:
+        1. PositionManager for BE/trailing/profit protection
+        2. Stop loss hit
+        3. Take profit hit
         """
         for pos in self._state["positions"]:
             if pos["symbol"] == symbol and pos["status"] == "OPEN":
@@ -1199,12 +1252,27 @@ Responda com JSON:
                 stop_loss = Decimal(pos["stop_loss"]) if pos.get("stop_loss") else None
                 take_profit = Decimal(pos["take_profit"]) if pos.get("take_profit") else None
 
+                # PositionManager evaluation (BE/trailing/profit protection)
+                pm_result = self.position_manager.evaluate(symbol, current_price)
+                if pm_result["action"] == "MOVE_STOP":
+                    new_stop = pm_result["new_stop"]
+                    pos["stop_loss"] = str(new_stop)
+                    logger.info(
+                        "Adaptive SL for %s: moved to %s (reason: %s)",
+                        symbol, new_stop, pm_result["reason"],
+                    )
+                    # Update stop_loss for SL/TP check below
+                    stop_loss = new_stop
+
                 # Check stop loss hit (price dropped below stop)
                 if stop_loss and current_price <= stop_loss:
                     logger.info(
                         "STOP LOSS hit for %s: price=%s <= stop=%s",
                         symbol, current_price, stop_loss,
                     )
+                    # Record trade before closing
+                    self._record_trade_close(symbol, pos, "STOP_LOSS", current_price)
+                    self.position_manager.unregister_position(symbol)
                     await self._close_position_by_id(pos["id"], "STOP_LOSS")
                     return
 
@@ -1214,8 +1282,38 @@ Responda com JSON:
                         "TAKE PROFIT hit for %s: price=%s >= target=%s",
                         symbol, current_price, take_profit,
                     )
+                    self._record_trade_close(symbol, pos, "TAKE_PROFIT", current_price)
+                    self.position_manager.unregister_position(symbol)
                     await self._close_position_by_id(pos["id"], "TAKE_PROFIT")
                     return
+
+    def _record_trade_close(self, symbol: str, pos: dict, reason: str, current_price: Decimal) -> None:
+        """Record trade close in journal."""
+        entry_price = Decimal(pos.get("entry_price", "0"))
+        quantity = Decimal(pos.get("quantity", "0"))
+        stop_loss = Decimal(pos["stop_loss"]) if pos.get("stop_loss") else entry_price
+
+        # Calculate R
+        risk = entry_price - stop_loss
+        realized_r = (current_price - entry_price) / risk if risk > 0 else Decimal("0")
+
+        # Calculate P&L
+        realized_pnl = (current_price - entry_price) * quantity
+
+        trade = TradeRecord(
+            symbol=symbol,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            action="CLOSE",
+            entry_price=entry_price,
+            exit_price=current_price,
+            stop_loss=stop_loss,
+            take_profit=Decimal(pos["take_profit"]) if pos.get("take_profit") else None,
+            setup_score=0,  # Will be set from decision record if available
+            realized_pnl=realized_pnl,
+            realized_r=realized_r,
+            exit_reason=reason,
+        )
+        self.trade_journal.record(trade)
 
     async def _close_position_by_id(self, position_id: str, reason: str) -> None:
         """Close a position by ID with reason logging."""

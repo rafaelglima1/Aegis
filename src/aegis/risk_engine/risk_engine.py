@@ -177,24 +177,27 @@ class RiskEngine:
     def evaluate(self, decision: DecisionContract,
                  current_price: Decimal | None = None,
                  market_state: dict[str, Any] | None = None,
-                 symbol: str = "") -> RiskDecision:
+                 symbol: str = "",
+                 setup_score: int | None = None) -> RiskDecision:
         """Evaluate a Decision Contract through deterministic risk checks.
 
         Performs comprehensive validation:
         1. Circuit breaker / kill switch
         2. HOLD/CLOSE shortcuts
         3. Confidence threshold (min_confidence from config)
-        4. Mandatory SL/TP
-        5. SL/TP validation
-        6. R/R ratio validation
-        7. Entry deviation check
-        8. Max positions
-        9. Max exposure
-        10. Daily loss limit
-        11. Daily trade limits
-        12. Cooldown
-        13. Anti flip-flop
-        14. Position sizing
+        4. Setup score threshold (if provided)
+        5. Daily loss escalation (3%/4%/5%)
+        6. Mandatory SL/TP
+        7. SL/TP validation
+        8. R/R ratio validation
+        9. Entry deviation check
+        10. Max positions
+        11. Max exposure
+        12. Daily loss limit
+        13. Daily trade limits
+        14. Cooldown
+        15. Anti flip-flop
+        16. Position sizing
         """
         violations: list[RiskLimitViolation] = []
 
@@ -238,6 +241,34 @@ class RiskEngine:
                         message=f"Confidence {decision.confidence} below minimum {self._limits.min_confidence}",
                     )
                 )
+
+            # Setup score threshold
+            if setup_score is not None and setup_score < self._limits.setup_score_min:
+                violations.append(
+                    RiskLimitViolation(
+                        code="LOW_SETUP_SCORE",
+                        message=f"Setup score {setup_score} below minimum {self._limits.setup_score_min}",
+                    )
+                )
+
+            # Daily loss escalation
+            daily_pnl_pct = self._daily_pnl / self._limits.reference_capital if self._limits.reference_capital > 0 else Decimal("0")
+            if daily_pnl_pct <= -self._limits.daily_loss_block_pct:
+                violations.append(
+                    RiskLimitViolation(
+                        code="DAILY_LOSS_BLOCKED",
+                        message=f"Daily loss {daily_pnl_pct:.2%} reached block threshold",
+                    )
+                )
+            elif daily_pnl_pct <= -self._limits.daily_loss_strong_pct:
+                # Only allow very strong setups
+                if setup_score is not None and setup_score < self._limits.setup_score_very_strong:
+                    violations.append(
+                        RiskLimitViolation(
+                            code="DAILY_LOSS_STRONG_ONLY",
+                            message=f"Daily loss {daily_pnl_pct:.2%} - only very strong setups allowed (score >= {self._limits.setup_score_very_strong})",
+                        )
+                    )
 
             # Mandatory stop loss
             if not decision.stop_loss or decision.stop_loss <= 0:
