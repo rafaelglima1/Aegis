@@ -234,15 +234,15 @@ class TestMaxPositionsSemDrift:
         assert config.max_positions != 5
 
     def test_factory_propagates_max_positions(self) -> None:
-        settings = Settings(trading_environment="LIVE", live_enabled=True, live_api_key="key", live_api_secret="secret", max_positions=3)
+        settings = Settings(trading_environment="LIVE", live_enabled=True, live_api_key="key", live_api_secret="secret", max_positions=1)
         broker = create_broker(settings)
         assert isinstance(broker, MercadoBitcoinBroker)
-        assert broker._config.max_positions == 1  # Clamped by Settings validator
+        assert broker._config.max_positions == 1
 
     def test_propagation_max_positions_3(self) -> None:
-        """AC-C10-07: RiskLimits clamps to MAX_POSITIONS_HARD_LIMIT=1."""
+        """AC-C10-07: RiskLimits max_simultaneous_positions = 1."""
         from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
-        settings = Settings(max_positions=3)
+        settings = Settings(max_positions=1)
         risk = RiskEngine(RiskLimits(max_simultaneous_positions=settings.max_positions))
         assert risk.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
 

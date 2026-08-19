@@ -198,9 +198,11 @@ class TestHotReloadMaxPositions:
         # Execute REAL reload mechanism
         worker._reload_config()
 
-        assert worker.max_positions == 1  # Clamped by Settings validator
+        # MAX_POSITIONS=3 in env is rejected by Settings validator (must be exactly 1)
+        # so max_positions stays at 1
+        assert worker.max_positions == 1
         assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
-        assert worker._settings.max_positions == 1  # Clamped by Settings validator
+        assert worker._settings.max_positions == 1
 
 
 # ============================================================

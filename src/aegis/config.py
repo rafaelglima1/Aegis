@@ -9,6 +9,7 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import lru_cache
+from typing import Any
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings
@@ -149,6 +150,13 @@ class Settings(BaseSettings):
         description="Live exchange API secret",
     )
 
+    # --- API Authentication ---
+    aegis_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("aegis_api_key", "AEGIS_API_KEY"),
+        description="API authentication key for sensitive endpoints",
+    )
+
     # --- Infrastructure ---
     database_url: str = Field(
         default="postgresql+asyncpg://aegis:aegis@localhost:5432/aegis",
@@ -185,10 +193,11 @@ class Settings(BaseSettings):
             i = int(v)
         except (ValueError, TypeError):
             raise ValueError(f"MAX_POSITIONS must be a valid integer, got: {v}")
-        if i < 1:
-            raise ValueError(f"MAX_POSITIONS must be >= 1, got: {i}")
-        if i > 1:
-            return 1  # AC-C10-07: Hard limit
+        if i != 1:
+            raise ValueError(
+                f"MAX_POSITIONS must be exactly 1 in V1.3. "
+                f"Received {i}. Single position only."
+            )
         return i
 
     @field_validator("risk_per_trade_pct", mode="before")

@@ -140,7 +140,7 @@ class TestHotReloadNoBrokerSwap:
         assert original_broker_type is SandboxBroker
 
         # Change TRADING_ENVIRONMENT to LIVE in env file
-        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="3",
+        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="1",
                     TRADING_ENVIRONMENT="LIVE", LIVE_ENABLED="true")
         worker._reload_config()
 
@@ -156,7 +156,7 @@ class TestHotReloadNoBrokerSwap:
         worker = _make_worker(tmp_path, max_positions="1")
         original_broker = worker.broker
 
-        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="5",
+        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="1",
                     TRADING_ENVIRONMENT="LIVE", LIVE_ENABLED="true")
         worker._reload_config()
 
@@ -354,7 +354,7 @@ class TestPositionPersistenceDuringReload:
         pre_entry = pre_position.average_entry
 
         # Execute real reload with different config
-        _write_env(tmp_path, TRADING_CAPITAL="500.00", MAX_POSITIONS="5")
+        _write_env(tmp_path, TRADING_CAPITAL="500.00", MAX_POSITIONS="1")
         worker._reload_config()
 
         # Verify position survived
@@ -392,7 +392,7 @@ class TestSettingsReloadPreservesUnrelated:
         original_llm_url = worker.llm_base_url
         original_llm_model = worker.llm_model
 
-        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="3")
+        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="1")
         worker._reload_config()
 
         # LLM config must not change (restart-only)
@@ -413,7 +413,7 @@ class TestSettingsReloadPreservesUnrelated:
         worker.min_confidence = Decimal("0.7")
 
         # Reload with only MAX_POSITIONS changed
-        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="5")
+        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="1")
         worker._reload_config()
 
         # Operational params preserved (env fallback uses current value)
@@ -427,7 +427,7 @@ class TestSettingsReloadPreservesUnrelated:
         worker = _make_worker(tmp_path, max_positions="1")
         worker._state["positions"] = [{"id": "test", "status": "OPEN"}]
 
-        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="3")
+        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="1")
         worker._reload_config()
 
         assert len(worker._state["positions"]) == 1

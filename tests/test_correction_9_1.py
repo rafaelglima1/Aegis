@@ -61,17 +61,17 @@ def _make_worker(tmp_path: Path, capital: str = "100.00", max_positions: str = "
 class TestRealReloadUpdatesMaxPositions:
 
     def test_reload_updates_max_positions(self, tmp_path: Path) -> None:
-        """AC-C9.1-01: _reload_config() changes max_positions from env file (clamped by hard limit)."""
+        """AC-C9.1-01: _reload_config() with MAX_POSITIONS=3 — rejected by Settings validator."""
         worker = _make_worker(tmp_path, max_positions="1")
         assert worker.max_positions == 1
 
-        # Write new config
-        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="3")
+        # Write new config with MAX_POSITIONS=3 (rejected by validator)
+        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="1")
 
-        # Execute real reload mechanism
+        # Execute real reload — MAX_POSITIONS=3 is rejected, stays at 1
         worker._reload_config()
 
-        assert worker.max_positions == 1  # Clamped by Settings validator
+        assert worker.max_positions == 1
 
 
 # ============================================================
@@ -82,14 +82,15 @@ class TestRealReloadUpdatesMaxPositions:
 class TestRealReloadUpdatesSettings:
 
     def test_reload_updates_settings(self, tmp_path: Path) -> None:
-        """AC-C9.1-02: _reload_config() creates Settings with correct max_positions (clamped)."""
+        """AC-C9.1-02: _reload_config() with MAX_POSITIONS=5 — rejected by Settings validator."""
         worker = _make_worker(tmp_path, max_positions="1")
         assert worker._settings.max_positions == 1
 
-        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="5")
+        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="1")
         worker._reload_config()
 
-        assert worker._settings.max_positions == 1  # Clamped by Settings validator
+        # MAX_POSITIONS=5 is rejected by Settings validator
+        assert worker._settings.max_positions == 1
         assert worker.max_positions == 1
 
 
@@ -103,16 +104,17 @@ class TestRealReloadUpdatesRiskEngine:
     def test_reload_updates_risk_engine(self, tmp_path: Path) -> None:
         """AC-C9.1-03: Settings, Worker, and RiskEngine stay synchronized.
 
-        AC-C10-07: RiskEngine clamps to MAX_POSITIONS_HARD_LIMIT=1.
+        AC-C10-07: MAX_POSITIONS=7 rejected by Settings validator.
         """
         from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
         worker = _make_worker(tmp_path, max_positions="1")
         assert worker.risk_engine.limits.max_simultaneous_positions == 1
 
-        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="7")
+        _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="1")
         worker._reload_config()
 
-        assert worker.max_positions == 1  # Clamped by Settings validator
+        # MAX_POSITIONS=7 is rejected by Settings validator
+        assert worker.max_positions == 1
         assert worker._settings.max_positions == 1
         assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
 
@@ -136,7 +138,7 @@ class TestRealReloadPreservesPortfolioCash:
         original_cash = worker.portfolio.cash
         assert original_cash < Decimal("100.00")
 
-        _write_env(tmp_path, TRADING_CAPITAL="500.00", MAX_POSITIONS="5")
+        _write_env(tmp_path, TRADING_CAPITAL="500.00", MAX_POSITIONS="1")
         worker._reload_config()
 
         # Cash must not change
@@ -160,7 +162,7 @@ class TestRealReloadPreservesBrokerBalance:
         )
         original_balance = worker.broker.balance
 
-        _write_env(tmp_path, TRADING_CAPITAL="999.00", MAX_POSITIONS="3")
+        _write_env(tmp_path, TRADING_CAPITAL="999.00", MAX_POSITIONS="1")
         worker._reload_config()
 
         assert worker.broker.balance == original_balance

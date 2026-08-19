@@ -54,9 +54,14 @@ class TestSettingsMaxPositions:
         assert settings.max_positions == 1
 
     def test_settings_custom_max_positions(self) -> None:
-        """Settings accepts max_positions (clamped by hard limit)."""
-        settings = Settings(max_positions=3)
-        assert settings.max_positions == 1  # Clamped to hard limit
+        """Settings max_positions must be exactly 1."""
+        settings = Settings(max_positions=1)
+        assert settings.max_positions == 1
+
+    def test_settings_rejects_max_positions_gt_1(self) -> None:
+        """Settings rejects max_positions > 1."""
+        with pytest.raises(ValueError, match="must be exactly 1"):
+            Settings(max_positions=3)
 
 
 # ============================================================
@@ -87,16 +92,16 @@ class TestWorkerCapitalFromSettings:
 
 
 class TestWorkerMaxPositionsFromSettings:
-    """AC-C8-04: Worker.max_positions == Settings.max_positions (clamped by hard limit)."""
+    """AC-C8-04: Worker.max_positions == Settings.max_positions."""
 
     def test_worker_max_positions_from_settings(self) -> None:
-        """Worker.max_positions derives from Settings, clamped to hard limit."""
+        """Worker.max_positions derives from Settings."""
         from aegis.worker import AutonomousWorker
 
-        settings = Settings(max_positions=3)
+        settings = Settings(max_positions=1)
         worker = AutonomousWorker(settings=settings)
         assert worker.max_positions == settings.max_positions
-        assert worker.max_positions == 1  # Clamped by hard limit
+        assert worker.max_positions == 1
 
     def test_worker_no_independent_max_positions_env(self) -> None:
         """AC-C8-17: Worker does not have independent MAX_POSITIONS env read."""
@@ -164,25 +169,23 @@ class TestRiskCapitalFromSettings:
 
 
 class TestRiskMaxPositionsFromSettings:
-    """AC-C8-07: RiskLimits.max_simultaneous_positions == Settings.max_positions (clamped by hard limit)."""
+    """AC-C8-07: RiskLimits.max_simultaneous_positions == Settings.max_positions."""
 
     def test_risk_max_positions_from_settings(self) -> None:
-        """RiskEngine receives max_simultaneous_positions from Settings, clamped to hard limit."""
+        """RiskEngine receives max_simultaneous_positions from Settings."""
         from aegis.worker import AutonomousWorker
-        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
 
-        settings = Settings(max_positions=3)
+        settings = Settings(max_positions=1)
         worker = AutonomousWorker(settings=settings)
-        assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
+        assert worker.risk_engine.limits.max_simultaneous_positions == 1
 
     def test_risk_max_positions_matches_settings(self) -> None:
-        """RiskLimits.max_simultaneous_positions is clamped to hard limit."""
+        """RiskLimits.max_simultaneous_positions matches Settings.max_positions."""
         from aegis.worker import AutonomousWorker
-        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
 
-        settings = Settings(max_positions=5)
+        settings = Settings(max_positions=1)
         worker = AutonomousWorker(settings=settings)
-        assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
+        assert worker.risk_engine.limits.max_simultaneous_positions == settings.max_positions
 
 
 # ============================================================
@@ -290,24 +293,15 @@ class TestDefaultMaxPositionsPropagation:
 
 
 class TestNonDefaultMaxPositionsPropagation:
-    """AC-C8-12: max_positions propagates, but is clamped by hard limit."""
+    """AC-C8-12: max_positions = 1 propagates correctly."""
 
-    def test_max_positions_3(self) -> None:
-        """Settings(3) -> Worker = 1 (clamped by Settings validator), Risk = 1."""
+    def test_max_positions_1(self) -> None:
+        """Settings(1) -> Worker = 1, Risk = 1."""
         from aegis.worker import AutonomousWorker
 
-        settings = Settings(max_positions=3)
+        settings = Settings(max_positions=1)
         worker = AutonomousWorker(settings=settings)
-        assert worker.max_positions == 1  # Clamped by Settings validator
-        assert worker.risk_engine.limits.max_simultaneous_positions == 1
-
-    def test_max_positions_5(self) -> None:
-        """Settings(5) -> Worker = 1 (clamped by Settings validator), Risk = 1."""
-        from aegis.worker import AutonomousWorker
-
-        settings = Settings(max_positions=5)
-        worker = AutonomousWorker(settings=settings)
-        assert worker.max_positions == 1  # Clamped by Settings validator
+        assert worker.max_positions == 1
         assert worker.risk_engine.limits.max_simultaneous_positions == 1
 
 
@@ -422,7 +416,7 @@ class TestNoHardcodedPrompt:
         """The default prompt template does not hardcode 'Máximo 1'."""
         from aegis.worker import AutonomousWorker
 
-        settings = Settings(max_positions=5)
+        settings = Settings(max_positions=1)
         worker = AutonomousWorker(settings=settings)
         # The default prompt should not contain hardcoded "Máximo 1"
         # Check the registered prompt version
@@ -533,10 +527,16 @@ class TestSettingsReadsFromEnvironment:
         get_settings.cache_clear()
 
     def test_settings_reads_max_positions_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Settings.max_positions reads MAX_POSITIONS env var (clamped by hard limit)."""
-        monkeypatch.setenv("MAX_POSITIONS", "4")
+        """Settings.max_positions reads MAX_POSITIONS env var (rejects > 1)."""
+        monkeypatch.setenv("MAX_POSITIONS", "1")
         settings = Settings()
-        assert settings.max_positions == 1  # Clamped by hard limit
+        assert settings.max_positions == 1
+
+    def test_settings_rejects_max_positions_gt_1_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Settings rejects MAX_POSITIONS > 1 from env."""
+        monkeypatch.setenv("MAX_POSITIONS", "4")
+        with pytest.raises(ValueError, match="must be exactly 1"):
+            Settings()
 
     def test_worker_inherits_env_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Worker picks up TRADING_CAPITAL from Settings which reads env."""

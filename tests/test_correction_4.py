@@ -496,7 +496,7 @@ class TestMercadoBitcoinConfigSentinel:
 
     def test_factory_overrides_with_settings(self) -> None:
         """Factory must propagate settings.max_positions, overriding sentinel."""
-        settings = Settings(max_positions=5)
+        settings = Settings(max_positions=1)
         broker = create_broker(settings)
         # SandboxBroker — can't inspect max_positions, but ensure no crash
         assert isinstance(broker, SandboxBroker)
@@ -509,7 +509,7 @@ class TestMercadoBitcoinConfigSentinel:
             settings = Settings(
                 trading_environment="LIVE",
                 live_enabled=True,
-                max_positions=7,
+                max_positions=1,
                 live_api_key="test",
                 live_api_secret="test",
             )

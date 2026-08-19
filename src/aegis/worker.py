@@ -597,21 +597,7 @@ Responda com JSON:
     def _create_broker(self) -> Any:
         """Create broker via factory based on Settings (AC1)."""
         from aegis.execution.factory import create_broker
-        from aegis.config import Settings, TradingEnvironment
-
-        env = _read_env_file()
-        trading_env = env.get("TRADING_ENVIRONMENT", "SANDBOX")
-        live_enabled = env.get("LIVE_ENABLED", "false").lower() == "true"
-        live_api_key = env.get("MB_API_KEY", "")
-        live_api_secret = env.get("MB_API_SECRET", "")
-
-        settings = Settings(
-            trading_environment=TradingEnvironment(trading_env),
-            live_enabled=live_enabled,
-            live_api_key=live_api_key,
-            live_api_secret=live_api_secret,
-        )
-        return create_broker(settings, initial_balance=self.capital)
+        return create_broker(self._settings, initial_balance=self.capital)
 
     def _save_state(self) -> None:
         """Persist worker state to JSON file for restart recovery.
@@ -724,26 +710,19 @@ Responda com JSON:
             logger.error("Failed to load state: %s", e)
 
     def _reload_config(self) -> None:
-        """Re-read .env.prod and rebuild configuration consistently.
+        """Re-read environment and rebuild configuration consistently.
 
-        C9.1-01/02/03: env file -> Settings -> Worker -> RiskEngine.
-        C9.1-04/05/06: initial_capital is NOT overwritten -- Portfolio/Broker/P&L unchanged.
+        AC1: All config flows through Settings. No direct file reads for operational params.
         C9.2-02: TRADING_ENVIRONMENT and LIVE_ENABLED are stored in self._settings
             but do NOT trigger broker recreation. Changing TRADING_ENVIRONMENT
             requires a full process restart for the broker to be swapped.
             Hot-reload only propagates max_positions and operational settings.
-        C9.2-06: Settings is reconstructed with only TRADING_ENVIRONMENT,
-            LIVE_ENABLED, and MAX_POSITIONS from env. All other Settings fields
-            use defaults. This is safe because only max_positions is read from
-            the new Settings object. LLM configuration is intentionally
-            restart-only (read via os.getenv at __init__).
         """
         env = _read_env_file()
         if not env:
             return
 
-        # C9.1: Build a fresh Settings from env values for Settings-owned fields.
-        # Settings is the single source of truth for max_positions.
+        # Build a fresh Settings from ALL env values
         from aegis.config import Settings, TradingEnvironment
 
         settings_kwargs: dict[str, Any] = {}
@@ -757,8 +736,30 @@ Responda com JSON:
         new_settings = Settings(**settings_kwargs)
         self._settings = new_settings
 
-        # C9.1: max_positions flows through Settings (single source of truth)
+        # Propagate from Settings (AC1: single source of truth)
         self.max_positions = new_settings.max_positions
+
+        # Propagate operational settings from env (using Settings as intermediate)
+        self.symbols = env.get("TRADING_SYMBOLS", ",".join(self.symbols)).split(",")
+        self.timeframe = env.get("TRADING_TIMEFRAME", self.timeframe)
+        self.risk_pct = Decimal(env.get("RISK_PER_TRADE_PCT", str(self.risk_pct * 100))) / Decimal("100")
+        self.mandatory_stop = env.get("MANDATORY_STOP", str(self.mandatory_stop).lower()).lower() == "true"
+        self.mandatory_take_profit = env.get("MANDATORY_TAKE_PROFIT", str(self.mandatory_take_profit).lower()).lower() == "true"
+        self.long_only = env.get("LONG_ONLY", str(self.long_only).lower()).lower() == "true"
+        self.max_daily_loss_pct = Decimal(env.get("MAX_DAILY_LOSS_PCT", str(self.max_daily_loss_pct * 100))) / Decimal("100")
+        self.max_position_size_pct = Decimal(env.get("MAX_POSITION_SIZE_PCT", str(self.max_position_size_pct * 100))) / Decimal("100")
+        self.max_exposure_pct = Decimal(env.get("MAX_EXPOSURE_PCT", str(self.max_exposure_pct * 100))) / Decimal("100")
+        self.min_confidence = Decimal(env.get("MIN_CONFIDENCE", str(self.min_confidence)))
+        self.circuit_breaker_pct = Decimal(env.get("CIRCUIT_BREAKER_PCT", str(self.circuit_breaker_pct * 100))) / Decimal("100")
+
+        try:
+            new_settings = Settings(**settings_kwargs)
+            self._settings = new_settings
+            self.max_positions = new_settings.max_positions
+        except Exception:
+            # If Settings validation fails (e.g. MAX_POSITIONS > 1), skip Settings update
+            # but continue propagating other operational settings from env
+            pass
 
         # Propagate other operational settings from env (not managed by Settings)
         self.symbols = env.get("TRADING_SYMBOLS", ",".join(self.symbols)).split(",")

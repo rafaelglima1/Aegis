@@ -18,18 +18,14 @@ from aegis.config import Settings, get_settings
 from aegis.api.settings import router as settings_router
 from aegis.api.websocket import router as ws_router, broadcast
 
-import os
-
-# AC1: Log level from Settings (not parallel os.getenv)
+# AC1: All config from Settings — no parallel os.getenv
 _settings_for_log = get_settings()
 logging.basicConfig(level=_settings_for_log.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("aegis")
 
 
-# AC10: API authentication boundary for sensitive endpoints.
-# Production: AEGIS_API_KEY MUST be set. Missing key = fail-closed.
-# Development: AEGIS_API_KEY not set = endpoints open (explicit opt-in).
-API_KEY = os.getenv("AEGIS_API_KEY", "")
+# AC1: AEGIS_API_KEY from Settings (not os.getenv)
+API_KEY = _settings_for_log.aegis_api_key
 _ENVIRONMENT = _settings_for_log.trading_environment.value
 
 
