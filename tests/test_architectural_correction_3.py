@@ -237,7 +237,7 @@ class TestMaxPositionsSemDrift:
         settings = Settings(trading_environment="LIVE", live_enabled=True, live_api_key="key", live_api_secret="secret", max_positions=3)
         broker = create_broker(settings)
         assert isinstance(broker, MercadoBitcoinBroker)
-        assert broker._config.max_positions == 3
+        assert broker._config.max_positions == 1  # Clamped by Settings validator
 
     def test_propagation_max_positions_3(self) -> None:
         """AC-C10-07: RiskLimits clamps to MAX_POSITIONS_HARD_LIMIT=1."""

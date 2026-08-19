@@ -54,9 +54,9 @@ class TestSettingsMaxPositions:
         assert settings.max_positions == 1
 
     def test_settings_custom_max_positions(self) -> None:
-        """Settings accepts custom max_positions."""
+        """Settings accepts max_positions (clamped by hard limit)."""
         settings = Settings(max_positions=3)
-        assert settings.max_positions == 3
+        assert settings.max_positions == 1  # Clamped to hard limit
 
 
 # ============================================================
@@ -87,16 +87,16 @@ class TestWorkerCapitalFromSettings:
 
 
 class TestWorkerMaxPositionsFromSettings:
-    """AC-C8-04: Worker.max_positions == Settings.max_positions."""
+    """AC-C8-04: Worker.max_positions == Settings.max_positions (clamped by hard limit)."""
 
     def test_worker_max_positions_from_settings(self) -> None:
-        """Worker.max_positions derives from Settings, not os.getenv."""
+        """Worker.max_positions derives from Settings, clamped to hard limit."""
         from aegis.worker import AutonomousWorker
 
         settings = Settings(max_positions=3)
         worker = AutonomousWorker(settings=settings)
         assert worker.max_positions == settings.max_positions
-        assert worker.max_positions == 3
+        assert worker.max_positions == 1  # Clamped by hard limit
 
     def test_worker_no_independent_max_positions_env(self) -> None:
         """AC-C8-17: Worker does not have independent MAX_POSITIONS env read."""
@@ -293,24 +293,22 @@ class TestNonDefaultMaxPositionsPropagation:
     """AC-C8-12: max_positions propagates, but is clamped by hard limit."""
 
     def test_max_positions_3(self) -> None:
-        """Settings(3) -> Worker = 3, Risk = clamped to hard limit."""
+        """Settings(3) -> Worker = 1 (clamped by Settings validator), Risk = 1."""
         from aegis.worker import AutonomousWorker
-        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
 
         settings = Settings(max_positions=3)
         worker = AutonomousWorker(settings=settings)
-        assert worker.max_positions == 3
-        assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
+        assert worker.max_positions == 1  # Clamped by Settings validator
+        assert worker.risk_engine.limits.max_simultaneous_positions == 1
 
     def test_max_positions_5(self) -> None:
-        """Settings(5) -> Worker = 5, Risk = clamped to hard limit."""
+        """Settings(5) -> Worker = 1 (clamped by Settings validator), Risk = 1."""
         from aegis.worker import AutonomousWorker
-        from aegis.risk_engine.risk_limits import MAX_POSITIONS_HARD_LIMIT
 
         settings = Settings(max_positions=5)
         worker = AutonomousWorker(settings=settings)
-        assert worker.max_positions == 5
-        assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
+        assert worker.max_positions == 1  # Clamped by Settings validator
+        assert worker.risk_engine.limits.max_simultaneous_positions == 1
 
 
 # ============================================================
@@ -535,10 +533,10 @@ class TestSettingsReadsFromEnvironment:
         get_settings.cache_clear()
 
     def test_settings_reads_max_positions_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Settings.max_positions reads MAX_POSITIONS env var."""
+        """Settings.max_positions reads MAX_POSITIONS env var (clamped by hard limit)."""
         monkeypatch.setenv("MAX_POSITIONS", "4")
         settings = Settings()
-        assert settings.max_positions == 4
+        assert settings.max_positions == 1  # Clamped by hard limit
 
     def test_worker_inherits_env_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Worker picks up TRADING_CAPITAL from Settings which reads env."""

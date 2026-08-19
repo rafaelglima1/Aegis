@@ -371,30 +371,30 @@ class AutonomousWorker:
     """
 
     def __init__(self, settings: Any | None = None) -> None:
-        # AC-C8-01/AC-C8-02: Settings is the single source of truth for capital and max_positions
+        # AC1: Settings is the single source of truth for all configuration
         if settings is None:
             from aegis.config import get_settings as _get_settings
             settings = _get_settings()
 
         self._settings = settings
 
-        # Load config from Settings (single source of truth)
-        self.llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-        self.llm_api_key = os.getenv("LLM_API_KEY", "")
-        self.llm_model = os.getenv("LLM_MODEL", "gpt-4")
-        self.symbols = os.getenv("TRADING_SYMBOLS", "BTC-BRL,ETH-BRL").split(",")
-        self.timeframe = os.getenv("TRADING_TIMEFRAME", "1h")
+        # AC3: All config from Settings — no parallel env access
+        self.llm_base_url = settings.llm_base_url
+        self.llm_api_key = settings.llm_api_key
+        self.llm_model = settings.llm_model
+        self.symbols = settings.trading_symbols_list
+        self.timeframe = settings.trading_timeframe
         self.capital = settings.initial_capital
-        self.risk_pct = Decimal(os.getenv("RISK_PER_TRADE_PCT", "1.0")) / Decimal("100")
+        self.risk_pct = settings.risk_per_trade_decimal
         self.max_positions = settings.max_positions
-        self.mandatory_stop = os.getenv("MANDATORY_STOP", "true").lower() == "true"
-        self.mandatory_take_profit = os.getenv("MANDATORY_TAKE_PROFIT", "true").lower() == "true"
-        self.long_only = os.getenv("LONG_ONLY", "true").lower() == "true"
-        self.max_daily_loss_pct = Decimal(os.getenv("MAX_DAILY_LOSS_PCT", "5.0")) / Decimal("100")
-        self.max_position_size_pct = Decimal(os.getenv("MAX_POSITION_SIZE_PCT", "20.0")) / Decimal("100")
-        self.max_exposure_pct = Decimal(os.getenv("MAX_EXPOSURE_PCT", "100.0")) / Decimal("100")
-        self.min_confidence = Decimal(os.getenv("MIN_CONFIDENCE", "0.5"))
-        self.circuit_breaker_pct = Decimal(os.getenv("CIRCUIT_BREAKER_PCT", "10.0")) / Decimal("100")
+        self.mandatory_stop = settings.mandatory_stop
+        self.mandatory_take_profit = settings.mandatory_take_profit
+        self.long_only = settings.long_only
+        self.max_daily_loss_pct = settings.max_daily_loss_decimal
+        self.max_position_size_pct = settings.max_position_size_decimal
+        self.max_exposure_pct = settings.max_exposure_decimal
+        self.min_confidence = settings.min_confidence
+        self.circuit_breaker_pct = settings.circuit_breaker_decimal
 
         # Components
         self.mb_api = MercadoBitcoinAPI()
@@ -595,13 +595,7 @@ Responda com JSON:
         }
 
     def _create_broker(self) -> Any:
-        """Create broker via factory based on environment configuration.
-
-        SANDBOX -> SandboxBroker
-        LIVE + LIVE_ENABLED=true -> MercadoBitcoinBroker
-        LIVE + LIVE_ENABLED=false -> RuntimeError
-        C7-02: Passes configured capital so SandboxBroker balance = Portfolio cash.
-        """
+        """Create broker via factory based on Settings (AC1)."""
         from aegis.execution.factory import create_broker
         from aegis.config import Settings, TradingEnvironment
 

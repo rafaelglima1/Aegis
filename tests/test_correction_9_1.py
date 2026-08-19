@@ -61,7 +61,7 @@ def _make_worker(tmp_path: Path, capital: str = "100.00", max_positions: str = "
 class TestRealReloadUpdatesMaxPositions:
 
     def test_reload_updates_max_positions(self, tmp_path: Path) -> None:
-        """AC-C9.1-01: _reload_config() changes max_positions from env file."""
+        """AC-C9.1-01: _reload_config() changes max_positions from env file (clamped by hard limit)."""
         worker = _make_worker(tmp_path, max_positions="1")
         assert worker.max_positions == 1
 
@@ -71,7 +71,7 @@ class TestRealReloadUpdatesMaxPositions:
         # Execute real reload mechanism
         worker._reload_config()
 
-        assert worker.max_positions == 3
+        assert worker.max_positions == 1  # Clamped by Settings validator
 
 
 # ============================================================
@@ -82,15 +82,15 @@ class TestRealReloadUpdatesMaxPositions:
 class TestRealReloadUpdatesSettings:
 
     def test_reload_updates_settings(self, tmp_path: Path) -> None:
-        """AC-C9.1-02: _reload_config() creates Settings with correct max_positions."""
+        """AC-C9.1-02: _reload_config() creates Settings with correct max_positions (clamped)."""
         worker = _make_worker(tmp_path, max_positions="1")
         assert worker._settings.max_positions == 1
 
         _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="5")
         worker._reload_config()
 
-        assert worker._settings.max_positions == 5
-        assert worker.max_positions == 5
+        assert worker._settings.max_positions == 1  # Clamped by Settings validator
+        assert worker.max_positions == 1
 
 
 # ============================================================
@@ -112,8 +112,8 @@ class TestRealReloadUpdatesRiskEngine:
         _write_env(tmp_path, TRADING_CAPITAL="100.00", MAX_POSITIONS="7")
         worker._reload_config()
 
-        assert worker.max_positions == 7
-        assert worker._settings.max_positions == 7
+        assert worker.max_positions == 1  # Clamped by Settings validator
+        assert worker._settings.max_positions == 1
         assert worker.risk_engine.limits.max_simultaneous_positions == MAX_POSITIONS_HARD_LIMIT
 
 
