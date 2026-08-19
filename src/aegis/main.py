@@ -1250,7 +1250,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/position/{position_id}/close")
     async def close_position(position_id: str, _auth: None = Depends(require_api_key)) -> dict[str, str]:
-        """AC-C10-10: Close a position through the worker. Requires API key.
+        """Close a position through the worker. Requires API key.
 
         Frontend -> Worker.close_position_manual -> Portfolio.close_position.
         """
@@ -1259,13 +1259,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         result = await worker.close_position_manual(position_id)
 
+        # Handle all possible statuses
         if result["status"] == "NOT_FOUND":
             return {"status": "error", "error": result["error"]}
         if result["status"] == "ERROR":
             return {"status": "error", "error": result.get("error", "Close failed")}
+        if result["status"] == "REJECTED":
+            return {"status": "error", "error": result.get("error", "Risk rejected CLOSE")}
+        if result["status"] == "BROKER_REJECTED":
+            return {"status": "error", "error": result.get("error", "Broker rejected SELL")}
 
-        await broadcast({"type": "position_closed", "position_id": position_id})
-        return {"status": "ok", "message": "Position closed", "pnl": result["pnl"]}
+        # Only broadcast if actually closed
+        if result["status"] == "CLOSED":
+            await broadcast({"type": "position_closed", "position_id": position_id})
+
+        return {"status": result["status"], "message": result.get("error", "Position closed"), "pnl": result.get("pnl", "0")}
 
     @app.post("/api/risk/kill-switch")
     async def toggle_kill_switch(request: KillSwitchRequest, _auth: None = Depends(require_api_key)) -> dict[str, str]:

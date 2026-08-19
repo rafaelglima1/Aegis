@@ -178,18 +178,20 @@ class SimpleLLMProvider(LLMProvider):
                 content = message.get("content") or ""
                 reasoning = message.get("reasoning") or ""
 
-                # If content is empty, try to extract JSON from reasoning
-                if not content.strip() and reasoning.strip():
-                    content = reasoning
-
-                logger.info("LLM response content: %s", content[:200])
-                logger.info("LLM response reasoning: %s", reasoning[:200])
+                # For reasoning models, JSON is often in reasoning field
+                # Try reasoning first if content doesn't contain JSON
                 result = self._parse_response(content)
 
-                # If parse failed and we have reasoning text, try extracting JSON from reasoning
-                if result.action == TradingAction.HOLD and result.confidence == Decimal("0") and reasoning.strip():
-                    logger.info("Content parse failed, trying reasoning text")
-                    result = self._parse_response(reasoning)
+                if result.action == TradingAction.HOLD and result.confidence == Decimal("0"):
+                    # Content parse failed, try reasoning
+                    if reasoning.strip():
+                        result = self._parse_response(reasoning)
+
+                    # If still failed, try combined content
+                    if result.action == TradingAction.HOLD and result.confidence == Decimal("0"):
+                        combined = (content + "\n" + reasoning).strip()
+                        if combined:
+                            result = self._parse_response(combined)
 
                 return result
             else:
@@ -208,9 +210,7 @@ class SimpleLLMProvider(LLMProvider):
             )
 
     def _parse_response(self, content: str) -> LLMResponse:
-        """Parse LLM JSON response."""
-        logger.info("Parsing LLM content (len=%d): %s", len(content), content[:300])
-
+        """Parse LLM JSON response with robust extraction."""
         if not content or not content.strip():
             logger.warning("Empty LLM content, defaulting to HOLD")
             return LLMResponse(
@@ -220,66 +220,78 @@ class SimpleLLMProvider(LLMProvider):
             )
 
         try:
-            # Try to extract JSON from response
+            # Step 1: Strip markdown code blocks
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0]
             elif "```" in content:
-                content = content.split("```")[1].split("```")[0]
+                parts = content.split("```")
+                if len(parts) >= 3:
+                    content = parts[1]
 
-            # Try to find JSON object in the content using brace matching
-            # Search from the END of content (JSON is typically at the end for reasoning models)
-            brace_positions = []
-            for i in range(len(content) - 1, -1, -1):
-                if content[i] == "{":
-                    brace_positions.append(i)
+            content = content.strip()
 
-            for brace_start in brace_positions:
-                depth = 0
-                in_string = False
-                escape = False
-                for i in range(brace_start, len(content)):
-                    c = content[i]
-                    if escape:
-                        escape = False
-                        continue
-                    if c == "\\":
-                        escape = True
-                        continue
-                    if c == '"':
-                        in_string = not in_string
-                        continue
-                    if not in_string:
-                        if c == "{":
-                            depth += 1
-                        elif c == "}":
-                            depth -= 1
-                            if depth == 0:
-                                candidate = content[brace_start : i + 1]
-                                # Validate it has "action" key
-                                if '"action"' in candidate:
-                                    content = candidate
-                                    break
-                else:
-                    continue
-                break
-
-            data = json.loads(content.strip())
-
-            action_str = data.get("action", "HOLD").upper()
+            # Step 2: Try direct JSON parse first
             try:
-                action = TradingAction(action_str)
-            except ValueError:
-                action = TradingAction.HOLD
+                data = json.loads(content)
+                return self._build_response(data)
+            except json.JSONDecodeError:
+                pass
 
+            # Step 3: Find JSON object using brace matching (search from end)
+            json_str = self._extract_json(content)
+            if json_str:
+                try:
+                    data = json.loads(json_str)
+                    return self._build_response(data)
+                except json.JSONDecodeError:
+                    pass
+
+            # Step 4: Try regex to find JSON pattern
+            import re
+            match = re.search(r'\{[^{}]*"action"[^{}]*\}', content, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group())
+                    return self._build_response(data)
+                except json.JSONDecodeError:
+                    pass
+
+            # Step 5: Try to find action/confidence/thesis with regex
+            action_match = re.search(r'"action"\s*:\s*"(LONG|HOLD|CLOSE)"', content)
+            conf_match = re.search(r'"confidence"\s*:\s*([\d.]+)', content)
+            thesis_match = re.search(r'"thesis"\s*:\s*"([^"]*)"', content)
+
+            if action_match:
+                action_str = action_match.group(1).upper()
+                try:
+                    action = TradingAction(action_str)
+                except ValueError:
+                    action = TradingAction.HOLD
+
+                confidence = Decimal(conf_match.group(1)) if conf_match else Decimal("0.5")
+                thesis = thesis_match.group(1) if thesis_match else "LLM response parsed via regex"
+
+                # Try to extract entry/stop/take_profit
+                entry_match = re.search(r'"entry_price"\s*:\s*([\d.]+)', content)
+                stop_match = re.search(r'"stop_loss"\s*:\s*([\d.]+)', content)
+                tp_match = re.search(r'"take_profit"\s*:\s*([\d.]+)', content)
+
+                return LLMResponse(
+                    action=action,
+                    confidence=confidence,
+                    thesis=thesis,
+                    entry_price=Decimal(entry_match.group(1)) if entry_match else None,
+                    stop_loss=Decimal(stop_match.group(1)) if stop_match else None,
+                    take_profit=Decimal(tp_match.group(1)) if tp_match else None,
+                )
+
+            logger.warning("Could not extract any trading decision from LLM response")
             return LLMResponse(
-                action=action,
-                confidence=Decimal(str(data.get("confidence", 0))),
-                thesis=data.get("thesis", ""),
-                entry_price=Decimal(str(data["entry_price"])) if data.get("entry_price") else None,
-                stop_loss=Decimal(str(data["stop_loss"])) if data.get("stop_loss") else None,
-                take_profit=Decimal(str(data["take_profit"])) if data.get("take_profit") else None,
-                reasoning=data.get("reasoning", ""),
+                action=TradingAction.HOLD,
+                confidence=Decimal("0"),
+                thesis="Could not parse LLM response",
             )
+
         except Exception as e:
             logger.error("Failed to parse LLM response: %s", e)
             return LLMResponse(
@@ -287,6 +299,63 @@ class SimpleLLMProvider(LLMProvider):
                 confidence=Decimal("0"),
                 thesis=f"Parse error: {e}",
             )
+
+    def _extract_json(self, text: str) -> str | None:
+        """Extract JSON object from text using brace matching."""
+        # Find all opening braces
+        for i in range(len(text) - 1, -1, -1):
+            if text[i] != "{":
+                continue
+
+            depth = 0
+            in_string = False
+            escape = False
+
+            for j in range(i, len(text)):
+                c = text[j]
+                if escape:
+                    escape = False
+                    continue
+                if c == "\\":
+                    escape = True
+                    continue
+                if c == '"':
+                    in_string = not in_string
+                    continue
+                if not in_string:
+                    if c == "{":
+                        depth += 1
+                    elif c == "}":
+                        depth -= 1
+                        if depth == 0:
+                            candidate = text[i : j + 1]
+                            if '"action"' in candidate:
+                                return candidate
+                            break
+        return None
+
+    def _build_response(self, data: dict) -> LLMResponse:
+        """Build LLMResponse from parsed JSON dict."""
+        action_str = data.get("action", "HOLD").upper()
+        try:
+            action = TradingAction(action_str)
+        except ValueError:
+            action = TradingAction.HOLD
+
+        confidence = Decimal(str(data.get("confidence", 0)))
+        # Clamp confidence to 0-1 range
+        if confidence > Decimal("1"):
+            confidence = confidence / Decimal("100")
+
+        return LLMResponse(
+            action=action,
+            confidence=confidence,
+            thesis=data.get("thesis", ""),
+            entry_price=Decimal(str(data["entry_price"])) if data.get("entry_price") else None,
+            stop_loss=Decimal(str(data["stop_loss"])) if data.get("stop_loss") else None,
+            take_profit=Decimal(str(data["take_profit"])) if data.get("take_profit") else None,
+            reasoning=data.get("reasoning", ""),
+        )
 
 
 class AutonomousWorker:
