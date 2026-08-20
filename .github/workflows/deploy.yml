@@ -1,0 +1,24 @@
+name: Deploy to Oracle
+
+on:
+  push:
+    branches: [phase-0/baseline]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.47.112.212
+          username: ubuntu
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/aegis
+            git fetch origin phase-0/baseline
+            git reset --hard origin/phase-0/baseline
+            docker compose -f docker-compose.prod.yml up -d --build --force-recreate api 2>&1 | tail -5
+            sleep 5
+            docker ps --filter name=aegis-api --format '{{.Names}}: {{.Status}}'
+            curl -s -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:8000/health
