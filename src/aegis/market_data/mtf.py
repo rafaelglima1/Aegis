@@ -9,17 +9,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any
 
 from aegis.market_data.contracts import Candle
 from aegis.market_data.validator import (
     BatchValidator,
     CandleValidator,
-    CandleValidationError,
-    TIMEFRAME_SECONDS,
-    VALID_TIMEFRAMES,
+    InvalidCandleError,
 )
 
 logger = logging.getLogger("aegis.mtf")
@@ -35,13 +32,25 @@ class MTFWeights:
     """Configurable weights for timeframe aggregation.
 
     Each weight represents the relative importance of a timeframe.
-    Total need not sum to 100 — normalization happens internally.
+    Total must be > 0. Individual weights may be 0 but not negative.
     """
 
     macro: Decimal = Decimal("35")    # 1D — macro context
     trend: Decimal = Decimal("30")    # 4H — main trend
     setup: Decimal = Decimal("25")    # 1H — setup
     timing: Decimal = Decimal("10")   # 15M — timing
+
+    def __post_init__(self) -> None:
+        for name in ("macro", "trend", "setup", "timing"):
+            v = getattr(self, name)
+            if not isinstance(v, Decimal):
+                raise TypeError(f"Weight '{name}' must be Decimal, got {type(v).__name__}")
+            if v < Decimal("0"):
+                raise ValueError(f"Weight '{name}' must be >= 0, got {v}")
+        if self.total <= Decimal("0"):
+            raise ValueError(
+                f"Sum of weights must be > 0, got {self.total}"
+            )
 
     @property
     def total(self) -> Decimal:
@@ -142,9 +151,10 @@ class TimeframeAnalyzer:
         Steps:
         1. Filter out future candles (timestamp > reference_time)
         2. Filter out open candles (is_closed == False)
-        3. Check minimum candle count
-        4. Run batch validation (duplicates, gaps)
-        5. Compute score and bias from closed candles
+        3. Validate each candle with CandleValidator
+        4. Check minimum candle count
+        5. Run batch validation (duplicates, gaps)
+        6. Compute score and bias from valid closed candles
         """
         tf = timeframe or (candles[0].timeframe if candles else "")
         r = role or MTF_ROLE_MAP.get(tf, "")
@@ -156,29 +166,52 @@ class TimeframeAnalyzer:
                 reasons=["No candles provided"],
             )
 
-        # Step 1: Filter future candles
-        valid_candles = [c for c in candles if c.timestamp <= reference_time]
+        # Step 1: Filter future candles (handle naive timestamps safely)
+        valid_candles: list[Candle] = []
+        for c in candles:
+            try:
+                if c.timestamp <= reference_time:
+                    valid_candles.append(c)
+            except TypeError:
+                # Naive timestamp vs aware reference_time — candle is invalid, skip
+                pass
         excluded_future = len(candles) - len(valid_candles)
 
         # Step 2: Filter open candles
         closed_candles = [c for c in valid_candles if c.is_closed]
         excluded_open = len(valid_candles) - len(closed_candles)
 
-        # Step 3: Check minimum
+        # Step 3: Validate each candle with CandleValidator
+        valid_closed: list[Candle] = []
+        invalid_count = 0
+        validation_reasons: list[str] = []
+        for c in closed_candles:
+            try:
+                CandleValidator.validate(c)
+                valid_closed.append(c)
+            except InvalidCandleError as e:
+                invalid_count += 1
+                validation_reasons.append(f"Invalid candle: {e}")
+
+        if invalid_count > 0:
+            closed_candles = valid_closed
+
+        # Step 4: Check minimum
         if len(closed_candles) < 2:
             return TimeframeResult(
                 timeframe=tf, role=r, bias="NEUTRAL", score=50,
                 confidence=Decimal("0"), data_quality="INSUFFICIENT_DATA",
                 candle_count=len(closed_candles),
-                reasons=[f"Insufficient closed candles: {len(closed_candles)} (need >= 2)"],
+                reasons=[f"Insufficient valid closed candles: {len(closed_candles)} (need >= 2)"]
+                + validation_reasons,
             )
 
-        # Step 4: Batch validation
+        # Step 5: Batch validation
         dups = BatchValidator.validate_duplicates(closed_candles)
         gaps = BatchValidator.validate_gaps(closed_candles)
         ordering = BatchValidator.validate_ordering(closed_candles)
 
-        reasons: list[str] = []
+        reasons: list[str] = list(validation_reasons)
         data_quality = "VALID"
 
         if dups:
@@ -194,8 +227,11 @@ class TimeframeAnalyzer:
             reasons.append(f"{excluded_future} future candle(s) excluded")
         if excluded_open > 0:
             reasons.append(f"{excluded_open} open candle(s) excluded")
+        if invalid_count > 0:
+            data_quality = "DEGRADED"
+            reasons.append(f"{invalid_count} invalid candle(s) rejected by validator")
 
-        # Step 5: Compute score and bias
+        # Step 6: Compute score and bias
         score, bias, score_reasons = self._compute_score(closed_candles)
         reasons.extend(score_reasons)
 
@@ -533,7 +569,10 @@ class MTFEngine:
         for r in results:
             w = role_weight_map.get(r.role, Decimal("0"))
             if r.data_quality == "INSUFFICIENT_DATA":
-                reasons.append(f"{r.role} ({r.timeframe}): INSUFFICIENT_DATA — excluded from aggregation")
+                reasons.append(
+                    f"{r.role} ({r.timeframe}): INSUFFICIENT_DATA"
+                    " — excluded from aggregation"
+                )
                 continue
 
             weighted_score += Decimal(str(r.score)) * w
@@ -600,7 +639,8 @@ class MTFEngine:
         """Determine final bias with higher-timeframe protection.
 
         If conflict exists, bias is NEUTRAL unless higher timeframes
-        are unanimously in one direction.
+        are unanimously in one direction. Final bias is always
+        LONG_BIAS, NEUTRAL, or SHORT_BIAS — never BULLISH/BEARISH.
         """
         valid = [r for r in results if r.data_quality != "INSUFFICIENT_DATA"]
         higher = [r for r in valid if r.role in ("macro", "trend")]
@@ -609,7 +649,12 @@ class MTFEngine:
             # Higher timeframe protection: if higher TFs agree, their bias wins
             higher_biases = [r.bias for r in higher]
             if len(higher_biases) >= 2 and all(b == higher_biases[0] for b in higher_biases):
-                return higher_biases[0]  # Higher TFs override conflict
+                # Map per-timeframe BULLISH/BEARISH to final LONG_BIAS/SHORT_BIAS
+                if higher_biases[0] == "BULLISH":
+                    return "LONG_BIAS"
+                elif higher_biases[0] == "BEARISH":
+                    return "SHORT_BIAS"
+                return "NEUTRAL"
             return "NEUTRAL"
 
         # No conflict: use score-based classification

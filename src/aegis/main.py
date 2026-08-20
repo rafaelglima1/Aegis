@@ -1209,8 +1209,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from aegis.ai_engine.decision_engine import DecisionContract
         from aegis.domain.enums import TradingAction
         from aegis.pipeline import TradingPipeline
+        from aegis.worker import get_worker
 
-        pipeline = TradingPipeline()
+        worker = get_worker()
+        # Share the worker's broker so BUY and SELL go through the same instance
+        pipeline = TradingPipeline(broker=worker.broker)
 
         # Create decision contract
         action = TradingAction(request.action.upper())
