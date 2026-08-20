@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 from aegis.domain.contracts import utc_now
 from aegis.domain.enums import OrderSide, OrderStatus
+from aegis.market_data.contracts import Candle as _CanonicalCandle
 from aegis.risk_engine.risk_limits import RiskLimits
 
 
@@ -23,17 +24,36 @@ class ReplayState(Enum):
     FAILED = "FAILED"
 
 
-@dataclass
-class Candle:
-    """Historical candle data."""
+def Candle(
+    timestamp: datetime,
+    open: Decimal,
+    high: Decimal,
+    low: Decimal,
+    close: Decimal,
+    volume: Decimal,
+    is_closed: bool = True,
+    *,
+    symbol: str = "",
+    timeframe: str = "",
+    source: str = "",
+) -> _CanonicalCandle:
+    """Backward-compatible Candle factory for replay.
 
-    timestamp: datetime
-    open: Decimal
-    high: Decimal
-    low: Decimal
-    close: Decimal
-    volume: Decimal
-    is_closed: bool = True
+    Creates a canonical Candle with legacy positional arguments.
+    New fields (symbol, timeframe, source) default to empty strings.
+    """
+    return _CanonicalCandle(
+        symbol=symbol,
+        timestamp=timestamp,
+        timeframe=timeframe,
+        open=open,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+        is_closed=is_closed,
+        source=source,
+    )
 
 
 @dataclass

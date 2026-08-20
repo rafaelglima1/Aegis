@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Callable
 from uuid import UUID, uuid4
 
 from aegis.domain.contracts import utc_now
+from aegis.market_data.contracts import Candle as _CanonicalCandle
 from aegis.risk_engine.risk_engine import RiskEngine
 from aegis.risk_engine.risk_limits import RiskLimits
 from aegis.risk_engine.setup_scorer import SetupScorer, SetupWeights
@@ -21,16 +23,44 @@ from aegis.risk_engine.position_manager import PositionManager, PositionManagerC
 logger = logging.getLogger("aegis.backtest_v2")
 
 
-@dataclass
-class Candle:
-    """Single OHLCV candle for backtesting."""
+def Candle(
+    timestamp: str | datetime,
+    open: Decimal,
+    high: Decimal,
+    low: Decimal,
+    close: Decimal,
+    volume: Decimal = Decimal("0"),
+    *,
+    symbol: str = "",
+    timeframe: str = "",
+    source: str = "",
+) -> _CanonicalCandle:
+    """Backward-compatible Candle factory for backtesting.
 
-    timestamp: str
-    open: Decimal
-    high: Decimal
-    low: Decimal
-    close: Decimal
-    volume: Decimal = Decimal("0")
+    Accepts both string and datetime timestamps.
+    Creates a canonical Candle with legacy positional arguments.
+    """
+    if isinstance(timestamp, str):
+        ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    elif isinstance(timestamp, datetime):
+        ts = timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+    else:
+        raise TypeError(f"Unsupported timestamp type: {type(timestamp)}")
+
+    return _CanonicalCandle(
+        symbol=symbol,
+        timestamp=ts,
+        timeframe=timeframe,
+        open=open,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+        is_closed=True,
+        source=source,
+    )
 
 
 @dataclass
@@ -202,7 +232,7 @@ class BacktestEngineV2:
                                 "stop_loss": decision["stop_loss"],
                                 "take_profit": decision["take_profit"],
                                 "quantity": quantity,
-                                "entry_time": candle.timestamp,
+                                "entry_time": candle.timestamp.isoformat(),
                                 "setup_score": setup_result.score,
                                 "confidence": decision.get("confidence", Decimal("0")),
                                 "regime": setup_result.market_regime,
@@ -245,7 +275,7 @@ class BacktestEngineV2:
             trade = TradeRecord(
                 symbol=symbol,
                 entry_time=position["entry_time"],
-                exit_time=candles[-1].timestamp,
+                exit_time=candles[-1].timestamp.isoformat(),
                 entry_price=position["entry_price"],
                 exit_price=exit_price,
                 stop_loss=position["stop_loss"],
@@ -493,12 +523,12 @@ class BacktestEngineV2:
         # Check stop loss hit (using low price for intra-candle)
         if candle.low <= stop:
             exit_price = self._apply_slippage(stop, "SELL")
-            return self._close_position(position, exit_price, candle.timestamp, "STOP_LOSS")
+            return self._close_position(position, exit_price, candle.timestamp.isoformat(), "STOP_LOSS")
 
         # Check take profit hit (using high price for intra-candle)
         if candle.high >= tp:
             exit_price = self._apply_slippage(tp, "SELL")
-            return self._close_position(position, exit_price, candle.timestamp, "TAKE_PROFIT")
+            return self._close_position(position, exit_price, candle.timestamp.isoformat(), "TAKE_PROFIT")
 
         return position, None
 

@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from aegis.domain.contracts import MarketState, utc_now
-from aegis.market_data.provider import Candle
+from aegis.market_data.contracts import Candle
 from aegis.market_data.validator import CandleValidator, InvalidCandleError
 
 

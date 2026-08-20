@@ -18,7 +18,7 @@ def make_candles(count: int = 5, is_closed: bool = True) -> list[Candle]:
     for i in range(count):
         candles.append(
             Candle(
-                asset="PETR4",
+                symbol="PETR4",
                 timestamp=base_time,
                 timeframe="1d",
                 open=Decimal("50.00"),
@@ -57,7 +57,7 @@ def test_market_state_rejects_look_ahead() -> None:
     """AC-04.07: Context Builder never uses future information."""
     builder = MarketStateBuilder()
     future_candle = Candle(
-        asset="PETR4",
+        symbol="PETR4",
         timestamp=datetime(2099, 1, 1, tzinfo=timezone.utc),
         timeframe="1d",
         open=Decimal("50.00"),

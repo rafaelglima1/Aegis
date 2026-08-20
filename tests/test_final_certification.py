@@ -64,7 +64,7 @@ def test_phase03_approved() -> None:
 def test_phase04_approved() -> None:
     """AC-16.01: Phase 04 approved."""
     candle = Candle(
-        asset="AAPL",
+        symbol="AAPL",
         timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc),
         timeframe="1h",
         open=Decimal("100"), high=Decimal("105"), low=Decimal("95"),

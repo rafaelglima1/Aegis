@@ -13,7 +13,7 @@ from aegis.market_data.validator import CandleValidator, InvalidCandleError
 
 def make_valid_candle(**overrides) -> Candle:
     defaults = dict(
-        asset="PETR4",
+        symbol="PETR4",
         timestamp=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
         timeframe="1d",
         open=Decimal("50.00"),

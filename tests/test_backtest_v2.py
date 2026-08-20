@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -21,8 +22,10 @@ from aegis.risk_engine.position_manager import PositionManagerConfig
 def _make_candles(n: int = 50, start: Decimal = Decimal("100"),
                   trend: str = "UP") -> list[Candle]:
     """Generate synthetic candle data for testing."""
+    from datetime import timedelta
     candles = []
     price = start
+    base_time = datetime(2025, 1, 1, tzinfo=timezone.utc)
     for i in range(n):
         if trend == "UP":
             change = Decimal("0.5") if i % 3 != 0 else Decimal("-0.3")
@@ -35,7 +38,7 @@ def _make_candles(n: int = 50, start: Decimal = Decimal("100"),
         high = price + Decimal("1")
         low = price - Decimal("1")
         candles.append(Candle(
-            timestamp=f"2025-01-{i+1:02d}T00:00:00Z",
+            timestamp=base_time + timedelta(days=i),
             open=price - change, high=high, low=low, close=price,
             volume=Decimal("1000"),
         ))
@@ -58,7 +61,7 @@ class TestBacktestEngine:
     def test_single_candle(self) -> None:
         """Single candle should return empty result."""
         engine = BacktestEngineV2()
-        result = engine.run("BTC-BRL", [Candle("t1", Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"))])
+        result = engine.run("BTC-BRL", [Candle("2025-01-01T00:00:00Z", Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"))])
         assert result.total_trades == 0
 
     def test_uptrend_generates_trades(self) -> None:
@@ -378,8 +381,8 @@ class TestCandleConversion:
     def test_convert_from_dicts(self) -> None:
         """Should convert dict list to Candle list."""
         data = [
-            {"timestamp": "t1", "open": "100", "high": "101", "low": "99", "close": "100", "volume": "1000"},
-            {"timestamp": "t2", "open": "100", "high": "102", "low": "98", "close": "101", "volume": "1200"},
+            {"timestamp": "2025-01-01T00:00:00Z", "open": "100", "high": "101", "low": "99", "close": "100", "volume": "1000"},
+            {"timestamp": "2025-01-02T00:00:00Z", "open": "100", "high": "102", "low": "98", "close": "101", "volume": "1200"},
         ]
         candles = create_candles_from_dicts(data)
         assert len(candles) == 2

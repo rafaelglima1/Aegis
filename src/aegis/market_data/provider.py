@@ -1,40 +1,14 @@
-"""AEGIS market data provider abstraction."""
+"""AEGIS market data provider abstraction.
+
+Re-exports canonical Candle from contracts module for backward compatibility.
+"""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from decimal import Decimal
 from typing import Any
 
-
-@dataclass(frozen=True)
-class Candle:
-    """OHLCV candle data."""
-
-    asset: str
-    timestamp: datetime
-    timeframe: str
-    open: Decimal
-    high: Decimal
-    low: Decimal
-    close: Decimal
-    volume: Decimal
-    is_closed: bool = False
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "asset": self.asset,
-            "timestamp": self.timestamp.isoformat(),
-            "timeframe": self.timeframe,
-            "open": str(self.open),
-            "high": str(self.high),
-            "low": str(self.low),
-            "close": str(self.close),
-            "volume": str(self.volume),
-            "is_closed": self.is_closed,
-        }
+from aegis.market_data.contracts import Candle
 
 
 class MarketDataProvider(ABC):
