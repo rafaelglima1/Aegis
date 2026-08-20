@@ -733,25 +733,6 @@ Responda com JSON:
         if "MAX_POSITIONS" in env:
             settings_kwargs["max_positions"] = int(env["MAX_POSITIONS"])
 
-        new_settings = Settings(**settings_kwargs)
-        self._settings = new_settings
-
-        # Propagate from Settings (AC1: single source of truth)
-        self.max_positions = new_settings.max_positions
-
-        # Propagate operational settings from env (using Settings as intermediate)
-        self.symbols = env.get("TRADING_SYMBOLS", ",".join(self.symbols)).split(",")
-        self.timeframe = env.get("TRADING_TIMEFRAME", self.timeframe)
-        self.risk_pct = Decimal(env.get("RISK_PER_TRADE_PCT", str(self.risk_pct * 100))) / Decimal("100")
-        self.mandatory_stop = env.get("MANDATORY_STOP", str(self.mandatory_stop).lower()).lower() == "true"
-        self.mandatory_take_profit = env.get("MANDATORY_TAKE_PROFIT", str(self.mandatory_take_profit).lower()).lower() == "true"
-        self.long_only = env.get("LONG_ONLY", str(self.long_only).lower()).lower() == "true"
-        self.max_daily_loss_pct = Decimal(env.get("MAX_DAILY_LOSS_PCT", str(self.max_daily_loss_pct * 100))) / Decimal("100")
-        self.max_position_size_pct = Decimal(env.get("MAX_POSITION_SIZE_PCT", str(self.max_position_size_pct * 100))) / Decimal("100")
-        self.max_exposure_pct = Decimal(env.get("MAX_EXPOSURE_PCT", str(self.max_exposure_pct * 100))) / Decimal("100")
-        self.min_confidence = Decimal(env.get("MIN_CONFIDENCE", str(self.min_confidence)))
-        self.circuit_breaker_pct = Decimal(env.get("CIRCUIT_BREAKER_PCT", str(self.circuit_breaker_pct * 100))) / Decimal("100")
-
         try:
             new_settings = Settings(**settings_kwargs)
             self._settings = new_settings
@@ -761,7 +742,7 @@ Responda com JSON:
             # but continue propagating other operational settings from env
             pass
 
-        # Propagate other operational settings from env (not managed by Settings)
+        # Propagate operational settings from env (using Settings as intermediate)
         self.symbols = env.get("TRADING_SYMBOLS", ",".join(self.symbols)).split(",")
         self.timeframe = env.get("TRADING_TIMEFRAME", self.timeframe)
         self.risk_pct = Decimal(env.get("RISK_PER_TRADE_PCT", str(self.risk_pct * 100))) / Decimal("100")
