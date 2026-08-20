@@ -1,4 +1,4 @@
-"""AEGIS market data package — Phase 2 Unified Market Data Contract."""
+"""AEGIS market data package — Phase 2 + Phase 3."""
 
 from aegis.market_data.contracts import Candle
 from aegis.market_data.provider import MarketDataProvider
@@ -14,6 +14,14 @@ from aegis.market_data.normalizer import MarketDataNormalizer, normalize_symbol,
 from aegis.market_data.cache import MarketDataCache
 from aegis.market_data.observability import MarketDataMetrics
 from aegis.market_data.context_builder import ContextBuilder, MarketStateBuilder
+from aegis.market_data.mtf import (
+    MTFEngine,
+    MTFWeights,
+    MTFResult,
+    TimeframeAnalyzer,
+    TimeframeResult,
+    DEFAULT_MTF_CONFIG,
+)
 
 __all__ = [
     "Candle",
@@ -31,4 +39,10 @@ __all__ = [
     "MarketDataMetrics",
     "ContextBuilder",
     "MarketStateBuilder",
+    "MTFEngine",
+    "MTFWeights",
+    "MTFResult",
+    "TimeframeAnalyzer",
+    "TimeframeResult",
+    "DEFAULT_MTF_CONFIG",
 ]
