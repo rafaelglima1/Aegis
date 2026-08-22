@@ -18,6 +18,7 @@ jobs:
             cd /home/ubuntu/aegis
             git fetch origin phase-0/baseline
             git reset --hard origin/phase-0/baseline
+            cp /home/ubuntu/.env.prod.aegis .env.prod
             docker compose -f docker-compose.prod.yml up -d --build --force-recreate api 2>&1 | tail -5
             sleep 5
             docker ps --filter name=aegis-api --format '{{.Names}}: {{.Status}}'
