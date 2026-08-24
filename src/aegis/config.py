@@ -6,6 +6,7 @@ No direct os.getenv() for operational configuration.
 
 from __future__ import annotations
 
+import hmac
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import lru_cache
@@ -18,6 +19,17 @@ from pydantic_settings import BaseSettings
 class TradingEnvironment(str, Enum):
     SANDBOX = "SANDBOX"
     LIVE = "LIVE"
+
+
+# Fields that must never appear in repr/str/logs
+_SECRET_FIELDS = frozenset({
+    "llm_api_key",
+    "sandbox_api_key",
+    "sandbox_api_secret",
+    "live_api_key",
+    "live_api_secret",
+    "aegis_api_key",
+})
 
 
 class Settings(BaseSettings):
@@ -301,6 +313,23 @@ class Settings(BaseSettings):
     def circuit_breaker_decimal(self) -> Decimal:
         """Circuit breaker as decimal fraction."""
         return self.circuit_breaker_pct / Decimal("100")
+
+    def _masked_dict(self) -> dict[str, Any]:
+        """Return field values with secrets masked."""
+        d = self.model_dump()
+        for k in d:
+            if k in _SECRET_FIELDS and d[k]:
+                d[k] = "***REDACTED***"
+        return d
+
+    def __repr__(self) -> str:
+        """Secret-safe repr — masks API keys and secrets."""
+        parts = ", ".join(f"{k}={v!r}" for k, v in self._masked_dict().items())
+        return f"Settings({parts})"
+
+    def __str__(self) -> str:
+        """Secret-safe str — masks API keys and secrets."""
+        return " ".join(f"{k}={v!r}" for k, v in self._masked_dict().items())
 
 
 # AC2: Cached singleton — all access goes through here

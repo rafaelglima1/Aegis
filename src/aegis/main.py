@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -56,7 +57,7 @@ async def require_api_key(authorization: str | None = Header(None)) -> None:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
 
     token = authorization.replace("Bearer ", "").strip()
-    if token != API_KEY:
+    if not hmac.compare_digest(token.encode(), API_KEY.encode()):
         raise HTTPException(status_code=403, detail="Invalid API key")
 
 
@@ -1179,8 +1180,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok", "environment": settings.trading_environment.value}
 
     @app.get("/health/ready")
-    async def readiness_check() -> dict[str, str]:
-        return {"status": "ready"}
+    async def readiness_check() -> dict[str, Any]:
+        """Readiness: checks worker is initialized and basic deps are reachable."""
+        issues: list[str] = []
+        worker_ok = False
+        try:
+            from aegis.worker import get_worker
+            w = get_worker()
+            worker_ok = w is not None
+        except Exception:
+            issues.append("worker_not_initialized")
+
+        return {
+            "status": "ready" if worker_ok and not issues else "not_ready",
+            "worker": "ok" if worker_ok else "error",
+            "issues": issues,
+        }
 
     @app.get("/api/state")
     async def get_state() -> dict[str, Any]:
