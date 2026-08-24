@@ -601,45 +601,69 @@ Responda com JSON:
 
     def _save_state(self) -> None:
         """Persist worker state to JSON file for restart recovery.
-        AC-FIN-12: Positions survive restart.
-        AC-C5-03: Portfolio financial state persists across restart.
-        C7-01: Portfolio peak_equity persists across restart.
-        C7-04: RiskEngine peak_equity persists across restart."""
+
+        Uses atomic write (temp file + rename) to prevent corruption on crash.
+        Persists: capital, pnl, fees, peak_equity, risk state, positions,
+                  orders, history, decisions.
+        """
         try:
+            risk_state = {}
+            if hasattr(self.risk_engine, '_daily_pnl'):
+                risk_state["daily_pnl"] = str(self.risk_engine._daily_pnl)
+            if hasattr(self.risk_engine, '_daily_trade_count'):
+                risk_state["daily_trade_count"] = self.risk_engine._daily_trade_count
+            if hasattr(self.risk_engine, '_last_trade_time'):
+                risk_state["last_trade_time"] = (
+                    self.risk_engine._last_trade_time.isoformat()
+                    if self.risk_engine._last_trade_time else None
+                )
+            if hasattr(self.risk_engine, '_kill_switch_active'):
+                risk_state["kill_switch_active"] = self.risk_engine._kill_switch_active
+            if hasattr(self.risk_engine, '_circuit_breaker_active'):
+                risk_state["circuit_breaker_active"] = self.risk_engine._circuit_breaker_active
+
             state_to_save = {
                 "capital": str(self.portfolio.cash),
                 "pnl": str(self.portfolio.total_realized_pnl),
                 "total_fees": str(self.portfolio.total_fees),
                 "peak_equity": str(self.portfolio._peak_equity),
                 "risk_peak_equity": str(self.risk_engine._peak_equity),
+                "risk_state": risk_state,
                 "positions": self._state["positions"],
                 "orders": self._state["orders"],
                 "history": self._state["history"],
                 "decisions": self._state["decisions"][-50:],
             }
-            _STATE_FILE.write_text(json.dumps(state_to_save, default=str), encoding="utf-8")
+            # Atomic write: write to temp file, then rename
+            tmp_file = _STATE_FILE.with_suffix(".tmp")
+            tmp_file.write_text(json.dumps(state_to_save, default=str), encoding="utf-8")
+            tmp_file.replace(_STATE_FILE)
         except Exception as e:
             logger.error("Failed to save state: %s", e)
 
     def _load_state(self) -> None:
         """Load persisted state and reconstruct Risk Engine + Portfolio.
-        AC-FIN-12: Risk Engine reconstructs positions after restart.
-        AC-FIN-13: Restart does not artificially zero positions_count.
-        AC-C5-03: Portfolio reconstructed from persisted financial state.
-        C7-01: Portfolio peak_equity restored from persisted state.
-        C7-04: RiskEngine peak_equity restored from persisted state."""
+
+        Restores: capital, pnl, fees, peak_equity, positions, risk state.
+        On JSON corruption: logs error, starts fresh with initial capital.
+        """
         if not _STATE_FILE.exists():
             logger.info("No persisted state found, starting fresh")
             return
 
         try:
             saved = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error("Corrupted state file, starting fresh: %s", e)
+            return
+
+        try:
             self._state["positions"] = saved.get("positions", [])
             self._state["orders"] = saved.get("orders", [])
             self._state["history"] = saved.get("history", [])
             self._state["decisions"] = saved.get("decisions", [])
 
-            # AC-C5-03: Reconstruct Portfolio from persisted financial state
+            # Reconstruct Portfolio from persisted financial state
             saved_capital = Decimal(saved.get("capital", str(self.capital)))
             saved_pnl = Decimal(saved.get("pnl", "0"))
             saved_fees = Decimal(saved.get("total_fees", "0"))
@@ -648,7 +672,7 @@ Responda com JSON:
             self.portfolio._total_realized_pnl = saved_pnl
             self.portfolio._total_fees = saved_fees
 
-            # C7-01: Restore Portfolio peak_equity (backward compat: default to capital)
+            # Restore Portfolio peak_equity
             saved_peak_equity = saved.get("peak_equity")
             if saved_peak_equity is not None:
                 self.portfolio._peak_equity = Decimal(saved_peak_equity)
@@ -675,7 +699,6 @@ Responda com JSON:
             # Sync state from Portfolio
             self._state["capital"] = str(self.portfolio.cash)
             self._state["pnl"] = str(self.portfolio.total_realized_pnl)
-            # C7-05: Expose equity for dashboard drawdown calculation
             self._state["equity"] = str(self.portfolio.equity)
 
             # Reconstruct Risk Engine state from persisted OPEN positions
@@ -687,27 +710,37 @@ Responda com JSON:
             )
             self.risk_engine.rebuild_from_open_positions(open_count, total_exposure)
 
-            # C7-04: Restore RiskEngine peak_equity (backward compat: default to reference_capital)
+            # Restore RiskEngine peak_equity
             saved_risk_peak = saved.get("risk_peak_equity")
             if saved_risk_peak is not None:
                 self.risk_engine._peak_equity = Decimal(saved_risk_peak)
             else:
                 self.risk_engine._peak_equity = self.risk_engine._limits.reference_capital
 
-            # C9-19: Sync broker balance with Portfolio (Portfolio is source of truth)
+            # Restore persisted risk state
+            risk_saved = saved.get("risk_state", {})
+            if "daily_pnl" in risk_saved:
+                self.risk_engine._daily_pnl = Decimal(risk_saved["daily_pnl"])
+            if "daily_trade_count" in risk_saved:
+                self.risk_engine._daily_trade_count = risk_saved["daily_trade_count"]
+            if "last_trade_time" in risk_saved and risk_saved["last_trade_time"]:
+                from datetime import datetime as _dt
+                self.risk_engine._last_trade_time = _dt.fromisoformat(risk_saved["last_trade_time"])
+            if "kill_switch_active" in risk_saved:
+                self.risk_engine._kill_switch_active = risk_saved["kill_switch_active"]
+            if "circuit_breaker_active" in risk_saved:
+                self.risk_engine._circuit_breaker_active = risk_saved["circuit_breaker_active"]
+
+            # Sync broker balance with Portfolio
             if hasattr(self.broker, "_balance"):
                 self.broker._balance = self.portfolio.cash
 
             logger.info(
-                "State restored: %d open positions, capital R$ %s, P&L R$ %s, exposure R$ %s, peak_equity R$ %s",
-                open_count,
-                self.portfolio.cash,
-                self.portfolio.total_realized_pnl,
-                total_exposure,
-                self.portfolio._peak_equity,
+                "State restored: %d open positions, capital R$ %s, P&L R$ %s",
+                open_count, self.portfolio.cash, self.portfolio.total_realized_pnl,
             )
         except Exception as e:
-            logger.error("Failed to load state: %s", e)
+            logger.error("Failed to restore state (starting fresh): %s", e)
 
     def _reload_config(self) -> None:
         """Re-read environment and rebuild configuration consistently.
