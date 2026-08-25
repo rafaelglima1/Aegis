@@ -621,10 +621,15 @@ Responda com JSON:
             if hasattr(self.risk_engine, '_daily_trade_count'):
                 risk_state["daily_trade_count"] = self.risk_engine._daily_trade_count
             if hasattr(self.risk_engine, '_last_trade_time'):
-                risk_state["last_trade_time"] = (
-                    self.risk_engine._last_trade_time.isoformat()
-                    if self.risk_engine._last_trade_time else None
-                )
+                # _last_trade_time is dict[symbol, timestamp] — serialize properly
+                ltt = self.risk_engine._last_trade_time
+                if isinstance(ltt, dict):
+                    risk_state["last_trade_time"] = {
+                        k: v.isoformat() if hasattr(v, 'isoformat') else str(v)
+                        for k, v in ltt.items()
+                    }
+                else:
+                    risk_state["last_trade_time"] = None
             if hasattr(self.risk_engine, '_kill_switch_active'):
                 risk_state["kill_switch_active"] = self.risk_engine._kill_switch_active
             if hasattr(self.risk_engine, '_circuit_breaker_active'):
@@ -641,6 +646,7 @@ Responda com JSON:
                 "orders": self._state["orders"],
                 "history": self._state["history"],
                 "decisions": self._state["decisions"][-50:],
+                "idempotency_keys": [str(k) for k in getattr(self.broker, '_idempotency_keys', set())],
             }
             # Atomic write: write to temp file, then rename
             tmp_file = _STATE_FILE.with_suffix(".tmp")
@@ -772,7 +778,15 @@ Responda com JSON:
                 self.risk_engine._daily_trade_count = risk_saved["daily_trade_count"]
             if "last_trade_time" in risk_saved and risk_saved["last_trade_time"]:
                 from datetime import datetime as _dt
-                self.risk_engine._last_trade_time = _dt.fromisoformat(risk_saved["last_trade_time"])
+                ltt = risk_saved["last_trade_time"]
+                if isinstance(ltt, dict):
+                    self.risk_engine._last_trade_time = {
+                        k: _dt.fromisoformat(v) if isinstance(v, str) else v
+                        for k, v in ltt.items()
+                    }
+                elif isinstance(ltt, str):
+                    # Backward compat: old single-value format
+                    self.risk_engine._last_trade_time = {"_default": _dt.fromisoformat(ltt)}
             if "kill_switch_active" in risk_saved:
                 self.risk_engine._kill_switch_active = risk_saved["kill_switch_active"]
             if "circuit_breaker_active" in risk_saved:
@@ -781,6 +795,14 @@ Responda com JSON:
             # Sync broker balance with Portfolio
             if hasattr(self.broker, "_balance"):
                 self.broker._balance = self.portfolio.cash
+
+            # Restore idempotency keys to prevent duplicate orders after restart
+            saved_keys = saved.get("idempotency_keys", [])
+            if saved_keys and hasattr(self.broker, "_idempotency_keys"):
+                from uuid import UUID as _UUID
+                self.broker._idempotency_keys.update(
+                    _UUID(k) for k in saved_keys
+                )
 
             self._state_valid = True
             logger.info(
@@ -1394,6 +1416,25 @@ Responda com JSON:
                     order_result.fill_price,
                 )
 
+            else:
+                # Order not filled (REJECTED, ERROR, SUBMITTED without fill)
+                order_record = {
+                    "id": str(order_result.order_id),
+                    "symbol": symbol,
+                    "side": "BUY",
+                    "quantity": str(risk_result.approved_quantity),
+                    "price": str(risk_result.approved_price),
+                    "status": order_result.status.value,
+                    "error": order_result.error,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                self._state["orders"].append(order_record)
+                self._save_state()
+                logger.warning(
+                    "Order not filled: %s — status=%s error=%s",
+                    symbol, order_result.status.value, order_result.error,
+                )
+
         elif decision.action == TradingAction.CLOSE:
             # C7-03: CLOSE routes through ExecutionEngine → Broker → Portfolio.
             # MercadoBitcoinBroker blocks SELL (V1.0 long-only) → fail-closed in LIVE.
@@ -1472,6 +1513,9 @@ Responda com JSON:
                     # Update risk engine
                     self.risk_engine.record_position_close()
                     self.risk_engine.record_daily_pnl(realized)
+
+                    # Persist immediately after autonomous close
+                    self._save_state()
 
                     logger.info(
                         "Position closed: %s, fill: R$ %s, P&L: R$ %s",
