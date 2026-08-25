@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -448,6 +448,7 @@ Responda com JSON:
 
         # State — all financial values stored as Decimal, not float
         self._running = False
+        self._state_valid = True  # False if persisted state is corrupted/incompatible
         self._state: dict[str, Any] = {
             "capital": str(self.capital),
             "pnl": "0.00",
@@ -476,7 +477,9 @@ Responda com JSON:
 
     @property
     def state(self) -> dict[str, Any]:
-        return self._state.copy()
+        s = self._state.copy()
+        s["state_valid"] = self._state_valid
+        return s
 
     async def close_position_manual(self, position_id: str) -> dict[str, Any]:
         """Close a position manually from the dashboard API.
@@ -644,19 +647,57 @@ Responda com JSON:
     def _load_state(self) -> None:
         """Load persisted state and reconstruct Risk Engine + Portfolio.
 
-        Restores: capital, pnl, fees, peak_equity, positions, risk state.
-        On JSON corruption: logs error, starts fresh with initial capital.
+        STATE UNKNOWN ≠ STATE EMPTY.
+        - File not found → first boot, start fresh (state_valid=True)
+        - File valid → restore state (state_valid=True)
+        - File corrupted / incompatible / read error → FAIL-SAFE (state_valid=False)
+          Process stays alive for observability but does NOT trade.
         """
         if not _STATE_FILE.exists():
-            logger.info("No persisted state found, starting fresh")
+            logger.info("No persisted state found, first boot — starting fresh")
+            self._state_valid = True
             return
 
+        # Try to read the file
         try:
-            saved = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.error("Corrupted state file, starting fresh: %s", e)
+            raw = _STATE_FILE.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.critical("Cannot read state file: %s — FAIL-SAFE", e)
+            self._state_valid = False
             return
 
+        # Try to parse JSON
+        try:
+            saved = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.critical(
+                "Corrupted state file — FAIL-SAFE. "
+                "File preserved at %s for investigation. Error: %s",
+                _STATE_FILE, e,
+            )
+            self._state_valid = False
+            return
+
+        # Validate required schema
+        if "positions" not in saved:
+            logger.critical(
+                "Incompatible state schema (missing 'positions') — FAIL-SAFE"
+            )
+            self._state_valid = False
+            return
+
+        # Validate capital if present (backward compat: old files may lack it)
+        if "capital" in saved:
+            try:
+                Decimal(saved["capital"])
+            except (InvalidOperation, ValueError, TypeError) as e:
+                logger.critical(
+                    "Invalid capital value in state file: %s — FAIL-SAFE", e
+                )
+                self._state_valid = False
+                return
+
+        # State is valid — restore it
         try:
             self._state["positions"] = saved.get("positions", [])
             self._state["orders"] = saved.get("orders", [])
@@ -664,6 +705,7 @@ Responda com JSON:
             self._state["decisions"] = saved.get("decisions", [])
 
             # Reconstruct Portfolio from persisted financial state
+            # Backward compat: old state files may lack "capital" field
             saved_capital = Decimal(saved.get("capital", str(self.capital)))
             saved_pnl = Decimal(saved.get("pnl", "0"))
             saved_fees = Decimal(saved.get("total_fees", "0"))
@@ -735,12 +777,14 @@ Responda com JSON:
             if hasattr(self.broker, "_balance"):
                 self.broker._balance = self.portfolio.cash
 
+            self._state_valid = True
             logger.info(
                 "State restored: %d open positions, capital R$ %s, P&L R$ %s",
                 open_count, self.portfolio.cash, self.portfolio.total_realized_pnl,
             )
         except Exception as e:
-            logger.error("Failed to restore state (starting fresh): %s", e)
+            logger.critical("Failed to restore state — FAIL-SAFE: %s", e)
+            self._state_valid = False
 
     def _reload_config(self) -> None:
         """Re-read environment and rebuild configuration consistently.
@@ -930,8 +974,19 @@ Responda com JSON:
     async def start(self) -> None:
         """Start the autonomous trading loop."""
         self._running = True
-        # AC-FIN-12: Load persisted state and rebuild Risk Engine on startup
         self._load_state()
+
+        if not self._state_valid:
+            logger.critical(
+                "Worker NOT READY — state is invalid. "
+                "Trading is BLOCKED until state is recovered. "
+                "Process alive for observability only."
+            )
+            # Stay alive but do not trade
+            while self._running:
+                await asyncio.sleep(60)
+            return
+
         logger.info("Autonomous worker started")
         logger.info("Symbols: %s", self.symbols)
         logger.info("Timeframe: %s", self.timeframe)
@@ -1179,6 +1234,9 @@ Responda com JSON:
                     "opened_at": datetime.now(timezone.utc).isoformat(),
                 }
                 self._state["positions"].append(position)
+
+                # Persist immediately after position creation (persistence boundary)
+                self._save_state()
 
                 # Record position state for anti-flip-flop
                 if decision.stop_loss and decision.take_profit:
