@@ -1181,25 +1181,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health/ready")
     async def readiness_check() -> dict[str, Any]:
-        """Readiness: checks worker is initialized and state is valid."""
+        """Readiness: checks worker, state validity, and reconciliation."""
         issues: list[str] = []
         worker_ok = False
         state_valid = False
+        reconciliation = "unknown"
         try:
             from aegis.worker import get_worker
             w = get_worker()
             worker_ok = w is not None
             state_valid = getattr(w, "_state_valid", False)
+            reconciliation = getattr(w, "_reconciliation_status", "NOT_RECONCILED")
         except Exception:
             issues.append("worker_not_initialized")
 
         if worker_ok and not state_valid:
             issues.append("state_invalid")
+        if worker_ok and reconciliation not in ("RECONCILED", "SKIPPED"):
+            # Only flag as issue if reconciliation was attempted
+            attempted = getattr(w, "_reconciliation_attempted", False)
+            if attempted:
+                issues.append("not_reconciled")
+
+        ready = worker_ok and state_valid and reconciliation in ("RECONCILED", "SKIPPED") and not issues
 
         return {
-            "status": "ready" if worker_ok and state_valid and not issues else "not_ready",
+            "status": "ready" if ready else "not_ready",
             "worker": "ok" if worker_ok else "error",
             "state_valid": state_valid,
+            "reconciliation": reconciliation,
             "issues": issues,
         }
 

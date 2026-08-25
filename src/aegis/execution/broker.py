@@ -63,3 +63,12 @@ class BrokerAdapter(ABC):
     @abstractmethod
     async def get_position(self, symbol: str) -> dict[str, Any]:
         """Get current position for a symbol."""
+
+    async def get_exchange_snapshot(self) -> Any:
+        """Get exchange state snapshot for reconciliation.
+
+        Returns ExchangeSnapshot or None if not supported.
+        Default implementation returns None (not supported).
+        Subclasses override for real implementations.
+        """
+        return None

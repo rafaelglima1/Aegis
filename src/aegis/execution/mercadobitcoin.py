@@ -436,3 +436,76 @@ class MercadoBitcoinBroker(BrokerAdapter):
     def __repr__(self) -> str:
         """Secrets never appear in logs."""
         return f"MercadoBitcoinBroker(enabled={self._config.enabled}, connected={self._connected})"
+
+    async def get_exchange_snapshot(self) -> Any:
+        """Query exchange for balances and open orders."""
+        from aegis.reconciliation import ExchangeSnapshot, ExchangeBalance, ExchangeOrder
+
+        if not self._connected:
+            try:
+                if not await self._authenticate():
+                    return ExchangeSnapshot(
+                        status="ERROR",
+                        error="Authentication failed",
+                    )
+            except Exception as e:
+                return ExchangeSnapshot(status="ERROR", error=str(e))
+
+        try:
+            # Get balances
+            response = await self._client.get(
+                "/api/v4/accounts/balances",
+                headers=self._get_auth_headers(),
+            )
+            if response.status_code != 200:
+                return ExchangeSnapshot(
+                    status="ERROR",
+                    error=f"Balance query failed: HTTP {response.status_code}",
+                )
+
+            balances = []
+            for item in response.json():
+                asset = item.get("available_currency", "")
+                available = Decimal(str(item.get("available", "0")))
+                locked = Decimal(str(item.get("locked", "0")))
+                if asset and (available > 0 or locked > 0):
+                    balances.append(ExchangeBalance(
+                        asset=asset, available=available, locked=locked,
+                    ))
+
+            # Get open orders
+            open_orders = []
+            try:
+                orders_response = await self._client.get(
+                    "/api/v4/orders",
+                    headers=self._get_auth_headers(),
+                )
+                if orders_response.status_code == 200:
+                    for item in orders_response.json():
+                        status_map = {
+                            "placed": "SUBMITTED",
+                            "partially_filled": "PARTIALLY_FILLED",
+                        }
+                        mb_status = item.get("status", "")
+                        if mb_status in status_map:
+                            open_orders.append(ExchangeOrder(
+                                exchange_order_id=str(item.get("id", "")),
+                                symbol=item.get("instrument", ""),
+                                side=item.get("side", "").upper(),
+                                quantity=Decimal(str(item.get("quantity", "0"))),
+                                filled_quantity=Decimal(str(item.get("executed_quantity", "0"))),
+                                price=Decimal(str(item.get("limit_price", "0"))),
+                                status=status_map[mb_status],
+                            ))
+            except Exception:
+                pass  # Open orders query is best-effort
+
+            return ExchangeSnapshot(
+                status="VALID",
+                balances=balances,
+                open_orders=open_orders,
+            )
+
+        except Exception as e:
+            self._audit("snapshot_error", {"error": str(e)})
+            return ExchangeSnapshot(status="ERROR", error=str(e))

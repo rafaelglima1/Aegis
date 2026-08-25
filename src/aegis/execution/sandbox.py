@@ -231,3 +231,52 @@ class SandboxBroker(BrokerAdapter):
             else:
                 total_qty -= qty
         return {"symbol": symbol, "quantity": max(total_qty, Decimal("0")), "orders": len(filled)}
+
+    async def get_exchange_snapshot(self) -> Any:
+        """Get sandbox state as ExchangeSnapshot for reconciliation."""
+        from aegis.reconciliation import ExchangeSnapshot, ExchangeBalance, ExchangeOrder
+
+        balances = [
+            ExchangeBalance(
+                asset="BRL",
+                available=self._balance,
+                locked=Decimal("0"),
+            )
+        ]
+
+        # Derive crypto balances from filled orders
+        crypto_balances: dict[str, Decimal] = {}
+        for o in self._orders.values():
+            if o.status != OrderStatus.FILLED:
+                continue
+            coin = o.symbol.split("-")[0]
+            qty = o.fill_quantity or Decimal("0")
+            if o.side == OrderSide.BUY:
+                crypto_balances[coin] = crypto_balances.get(coin, Decimal("0")) + qty
+            else:
+                crypto_balances[coin] = crypto_balances.get(coin, Decimal("0")) - qty
+
+        for coin, qty in crypto_balances.items():
+            if qty > 0:
+                balances.append(ExchangeBalance(
+                    asset=coin, available=qty, locked=Decimal("0"),
+                ))
+
+        open_orders = []
+        for o in self._orders.values():
+            if o.status in (OrderStatus.SUBMITTED, OrderStatus.ACKNOWLEDGED):
+                open_orders.append(ExchangeOrder(
+                    exchange_order_id=str(o.order_id),
+                    symbol=o.symbol,
+                    side=o.side.value,
+                    quantity=o.quantity,
+                    filled_quantity=o.fill_quantity or Decimal("0"),
+                    price=o.price,
+                    status=o.status.value,
+                ))
+
+        return ExchangeSnapshot(
+            status="VALID",
+            balances=balances,
+            open_orders=open_orders,
+        )

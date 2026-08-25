@@ -449,6 +449,9 @@ Responda com JSON:
         # State — all financial values stored as Decimal, not float
         self._running = False
         self._state_valid = True  # False if persisted state is corrupted/incompatible
+        self._reconciled = False  # False until exchange reconciliation confirms
+        self._reconciliation_attempted = False  # True once reconciliation was attempted
+        self._reconciliation_status = "SKIPPED"  # Until reconciliation runs
         self._state: dict[str, Any] = {
             "capital": str(self.capital),
             "pnl": "0.00",
@@ -479,6 +482,8 @@ Responda com JSON:
     def state(self) -> dict[str, Any]:
         s = self._state.copy()
         s["state_valid"] = self._state_valid
+        s["reconciled"] = self._reconciled
+        s["reconciliation_status"] = self._reconciliation_status
         return s
 
     async def close_position_manual(self, position_id: str) -> dict[str, Any]:
@@ -786,6 +791,96 @@ Responda com JSON:
             logger.critical("Failed to restore state — FAIL-SAFE: %s", e)
             self._state_valid = False
 
+    async def _reconcile_exchange(self) -> None:
+        """Reconcile local state against exchange state.
+
+        Must be called after _load_state() and before trading begins.
+        Blocks trading if reconciliation fails or diverges.
+        """
+        from aegis.reconciliation import (
+            ReconciliationEngine, ExchangeSnapshot,
+            LocalSnapshot, LocalPosition, LocalOrder,
+            ReconciliationStatus,
+        )
+
+        self._reconciliation_status = "RECONCILING"
+        self._reconciliation_attempted = True
+
+        # Build local snapshot
+        local_positions = []
+        for pos in self._state.get("positions", []):
+            if pos.get("status") == "OPEN":
+                local_positions.append(LocalPosition(
+                    symbol=pos["symbol"],
+                    quantity=Decimal(pos.get("quantity", "0")),
+                    entry_price=Decimal(pos.get("entry_price", "0")),
+                    status="OPEN",
+                ))
+
+        local_orders = []
+        for order in self._state.get("orders", []):
+            if order.get("status") in ("SUBMITTED", "PENDING"):
+                local_orders.append(LocalOrder(
+                    local_order_id=order.get("id", ""),
+                    symbol=order.get("symbol", ""),
+                    side=order.get("side", ""),
+                    quantity=Decimal(order.get("quantity", "0")),
+                    status=order.get("status", ""),
+                ))
+
+        local_snapshot = LocalSnapshot(
+            capital=self.portfolio.cash,
+            positions=local_positions,
+            orders=local_orders,
+            state_valid=self._state_valid,
+        )
+
+        # Get exchange snapshot
+        try:
+            exchange_snapshot = await self.broker.get_exchange_snapshot()
+        except Exception as e:
+            logger.critical("Exchange snapshot failed: %s — reconciliation ERROR", e)
+            self._reconciliation_status = "ERROR"
+            self._reconciled = False
+            return
+
+        if exchange_snapshot is None:
+            # Broker doesn't support snapshots (e.g., old adapter)
+            logger.warning(
+                "Broker does not support exchange snapshot — "
+                "skipping reconciliation (SANDBOX mode)"
+            )
+            self._reconciliation_status = "SKIPPED"
+            self._reconciled = True
+            return
+
+        # Run reconciliation
+        engine = ReconciliationEngine()
+        result = engine.reconcile(local_snapshot, exchange_snapshot)
+
+        self._reconciliation_status = result.status.value
+        self._reconciled = result.is_reconciled
+
+        if result.is_reconciled:
+            logger.info("Exchange reconciliation: RECONCILED")
+            if result.divergences:
+                for d in result.divergences:
+                    logger.warning(
+                        "Reconciliation warning: %s — %s",
+                        d.field, d.message,
+                    )
+        else:
+            logger.critical(
+                "Exchange reconciliation: %s — %s. Trading BLOCKED.",
+                result.status.value,
+                result.error or f"{len(result.divergences)} divergence(s)",
+            )
+            for d in result.divergences:
+                logger.critical(
+                    "  Divergence [%s]: local=%s exchange=%s — %s",
+                    d.severity.value, d.local_value, d.exchange_value, d.message,
+                )
+
     def _reload_config(self) -> None:
         """Re-read environment and rebuild configuration consistently.
 
@@ -982,7 +1077,19 @@ Responda com JSON:
                 "Trading is BLOCKED until state is recovered. "
                 "Process alive for observability only."
             )
-            # Stay alive but do not trade
+            while self._running:
+                await asyncio.sleep(60)
+            return
+
+        # Exchange reconciliation before trading
+        await self._reconcile_exchange()
+
+        if not self._reconciled:
+            logger.critical(
+                "Worker NOT READY — exchange reconciliation failed. "
+                "Status: %s. Trading is BLOCKED.",
+                self._reconciliation_status,
+            )
             while self._running:
                 await asyncio.sleep(60)
             return
