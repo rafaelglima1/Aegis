@@ -614,8 +614,7 @@ Responda com JSON:
         """Persist worker state to JSON file for restart recovery.
 
         Uses atomic write (temp file + rename) to prevent corruption on crash.
-        Persists: capital, pnl, fees, peak_equity, risk state, positions,
-                  orders, history, decisions.
+        On failure: sets _state_valid = False, blocks trading (FAIL-SAFE).
         """
         try:
             risk_state = {}
@@ -624,7 +623,6 @@ Responda com JSON:
             if hasattr(self.risk_engine, '_daily_trade_count'):
                 risk_state["daily_trade_count"] = self.risk_engine._daily_trade_count
             if hasattr(self.risk_engine, '_last_trade_time'):
-                # _last_trade_time is dict[symbol, timestamp] — serialize properly
                 ltt = self.risk_engine._last_trade_time
                 if isinstance(ltt, dict):
                     risk_state["last_trade_time"] = {
@@ -656,7 +654,9 @@ Responda com JSON:
             tmp_file.write_text(json.dumps(state_to_save, default=str), encoding="utf-8")
             tmp_file.replace(_STATE_FILE)
         except Exception as e:
-            logger.error("Failed to save state: %s", e)
+            logger.critical("PERSISTENCE FAILURE — FAIL-SAFE: %s", e)
+            self._state_valid = False
+            self._reconciled = False
 
     def _load_state(self) -> None:
         """Load persisted state and reconstruct Risk Engine + Portfolio.
@@ -1050,11 +1050,13 @@ Responda com JSON:
             status=_OS.ERROR,
             error=f"Status unknown after {max_retries} polling attempts",
         )
+
+    def _reload_config(self) -> None:
+        """Re-read environment and rebuild configuration consistently."""
         env = _read_env_file()
         if not env:
             return
 
-        # Build a fresh Settings from ALL env values
         from aegis.config import Settings, TradingEnvironment
 
         settings_kwargs: dict[str, Any] = {}
@@ -1070,11 +1072,8 @@ Responda com JSON:
             self._settings = new_settings
             self.max_positions = new_settings.max_positions
         except Exception:
-            # If Settings validation fails (e.g. MAX_POSITIONS > 1), skip Settings update
-            # but continue propagating other operational settings from env
             pass
 
-        # Propagate operational settings from env (using Settings as intermediate)
         self.symbols = env.get("TRADING_SYMBOLS", ",".join(self.symbols)).split(",")
         self.timeframe = env.get("TRADING_TIMEFRAME", self.timeframe)
         self.risk_pct = Decimal(env.get("RISK_PER_TRADE_PCT", str(self.risk_pct * 100))) / Decimal("100")
@@ -1087,7 +1086,6 @@ Responda com JSON:
         self.min_confidence = Decimal(env.get("MIN_CONFIDENCE", str(self.min_confidence)))
         self.circuit_breaker_pct = Decimal(env.get("CIRCUIT_BREAKER_PCT", str(self.circuit_breaker_pct * 100))) / Decimal("100")
 
-        # C9.1: Propagate from Worker → RiskEngine (reference_capital stays unchanged)
         self.risk_engine.limits = RiskLimits(
             reference_capital=self.capital,
             max_risk_per_trade_pct=self.risk_pct,
@@ -1098,7 +1096,6 @@ Responda com JSON:
             max_exposure_pct=self.max_exposure_pct,
         )
 
-        # Update state from Portfolio (single source of truth, not config)
         self._state["capital"] = str(self.portfolio.cash)
         self._state["pnl"] = str(self.portfolio.total_realized_pnl)
         self._state["equity"] = str(self.portfolio.equity)
@@ -1116,93 +1113,11 @@ Responda com JSON:
             "max_exposure_pct": str(self.max_exposure_pct * 100),
         }
 
-        # Rebuild LLM prompt from file or fallback to dynamic
         if _PROMPT_FILE.exists():
             template = _PROMPT_FILE.read_text(encoding="utf-8")
             logger.info("Loaded prompt from file (%d chars)", len(template))
         else:
             direction = "Apenas LONG (sem SHORT)" if self.long_only else "LONG e SHORT"
-            sl_tp_rules = []
-            if self.mandatory_stop:
-                sl_tp_rules.append("- Stop loss obrigatório")
-            else:
-                sl_tp_rules.append("- Stop loss opcional")
-            if self.mandatory_take_profit:
-                sl_tp_rules.append("- Take profit obrigatório")
-            else:
-                sl_tp_rules.append("- Take profit opcional")
-
-            _rules = "\n".join(sl_tp_rules)
-            _max_pos = self.max_positions
-            _risk = self.risk_pct * 100
-            _cap = self.capital
-            _conf = self.min_confidence * 100
-            _daily = self.max_daily_loss_pct * 100
-            _pos_sz = self.max_position_size_pct * 100
-            _rr = self.risk_engine.limits.min_risk_reward
-
-            template = (
-                "Voce e um trader de swing trade de criptomoedas profissional.\n"
-                "Analise os dados de mercado e tome uma decisao de trading.\n"
-                "\n"
-                "DADOS DE MERCADO:\n"
-                "{market_state}\n"
-                "\n"
-                "PORTFOLIO ATUAL:\n"
-                "{portfolio}\n"
-                "\n"
-                "REGRAS OBRIGATORIAS (validadas pelo codigo):\n"
-                f"- Apenas LONG (sem SHORT)\n"
-                f"- Maximo {_max_pos} posicao(oes) aberta(s)\n"
-                f"- Stop loss OBRIGATORIO e VALIDO (abaixo do entry)\n"
-                f"- Take profit OBRIGATORIO e VALIDO (acima do entry)\n"
-                f"- R/R minimo de {_rr} (reward/risk >= {_rr})\n"
-                f"- Risk por trade: {_risk}% do capital (R$ {_cap})\n"
-                f"- Tamanho maximo: {_pos_sz}% do capital\n"
-                f"- Confidence minima: {_conf}%\n"
-                f"- Perda diaria maxima: {_daily}%\n"
-                "\n"
-                "FILTROS OBRIGATORIOS:\n"
-                "- NAO entre LONG contra tendencia BEARISH (preco < SMA20 < SMA50)\n"
-                "- NAO entre LONG se R/R < 1.5\n"
-                "- NAO entre LONG se confidence < 50%\n"
-                "- NAO entre LONG sem stop loss VALIDO\n"
-                "- NAO entre LONG sem take profit VALIDO\n"
-                "- NAO feche posicao por ruido de curto prazo\n"
-                "- NAO faca flip-flop (LONG -> CLOSE -> LONG imediato)\n"
-                "- Considere a tendencia, momentum, volume e RSI\n"
-                "- Prefira HOLD a operacao ruim\n"
-                "- PRESERVE CAPITAL: e melhor nao operar do que operar mal\n"
-                "\n"
-                "ANALISE TECNICA:\n"
-                "- Verifique SMA20 vs SMA50 (tendencia)\n"
-                "- Verifique RSI (sobrecomprado >70, sobrevendido <30)\n"
-                "- Verifique momentum (ultimos candles)\n"
-                "- Verifique volume (confirmacao)\n"
-                "- Calcule R/R REAL antes de sugerir entry/stop/take_profit\n"
-                "- Considere o setup_score e market_regime nos dados de mercado\n"
-                "- Para LONG, prefira regime BULL/STRONG_BULL com score >= 65\n"
-                "- NAO entre LONG em regime BEAR/STRONG_BEAR\n"
-                "\n"
-                "Responda com JSON:\n"
-                "{{\n"
-                '    "action": "LONG" ou "HOLD" ou "CLOSE",\n'
-                '    "confidence": 0.0 a 1.0,\n'
-                '    "thesis": "raciocinio breve e justificativa",\n'
-                '    "entry_price": numero ou null,\n'
-                '    "stop_loss": numero ou null,\n'
-                '    "take_profit": numero ou null,\n'
-                '    "reasoning": "analise tecnica detalhada com R/R"\n'
-                "}}"
-            )
-
-        self.prompt_manager.register(
-            PromptVersion(
-                version="trading_v1",
-                template=template,
-                description="Dynamic trading prompt from config",
-            )
-        )
         logger.info("Config reloaded: %d symbols, max_positions=%d, risk=%.1f%%",
                      len(self.symbols), self.max_positions, self.risk_pct * 100)
 

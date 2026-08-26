@@ -438,7 +438,11 @@ class MercadoBitcoinBroker(BrokerAdapter):
         return f"MercadoBitcoinBroker(enabled={self._config.enabled}, connected={self._connected})"
 
     async def get_exchange_snapshot(self) -> Any:
-        """Query exchange for balances and open orders."""
+        """Query exchange for balances and open orders atomically.
+
+        Both must succeed for VALID status.
+        If either fails, returns UNKNOWN or ERROR.
+        """
         from aegis.reconciliation import ExchangeSnapshot, ExchangeBalance, ExchangeOrder
 
         if not self._connected:
@@ -453,18 +457,18 @@ class MercadoBitcoinBroker(BrokerAdapter):
 
         try:
             # Get balances
-            response = await self._client.get(
+            balances_response = await self._client.get(
                 "/api/v4/accounts/balances",
                 headers=self._get_auth_headers(),
             )
-            if response.status_code != 200:
+            if balances_response.status_code != 200:
                 return ExchangeSnapshot(
                     status="ERROR",
-                    error=f"Balance query failed: HTTP {response.status_code}",
+                    error=f"Balance query failed: HTTP {balances_response.status_code}",
                 )
 
             balances = []
-            for item in response.json():
+            for item in balances_response.json():
                 asset = item.get("available_currency", "")
                 available = Decimal(str(item.get("available", "0")))
                 locked = Decimal(str(item.get("locked", "0")))
@@ -473,14 +477,17 @@ class MercadoBitcoinBroker(BrokerAdapter):
                         asset=asset, available=available, locked=locked,
                     ))
 
-            # Get open orders
+            # Get open orders — if this fails, snapshot is NOT VALID
             open_orders = []
+            orders_failed = False
             try:
                 orders_response = await self._client.get(
                     "/api/v4/orders",
                     headers=self._get_auth_headers(),
                 )
-                if orders_response.status_code == 200:
+                if orders_response.status_code != 200:
+                    orders_failed = True
+                else:
                     for item in orders_response.json():
                         status_map = {
                             "placed": "SUBMITTED",
@@ -498,7 +505,14 @@ class MercadoBitcoinBroker(BrokerAdapter):
                                 status=status_map[mb_status],
                             ))
             except Exception:
-                pass  # Open orders query is best-effort
+                orders_failed = True
+
+            if orders_failed:
+                return ExchangeSnapshot(
+                    status="UNKNOWN",
+                    error="Balances OK but open orders query failed",
+                    balances=balances,
+                )
 
             return ExchangeSnapshot(
                 status="VALID",
