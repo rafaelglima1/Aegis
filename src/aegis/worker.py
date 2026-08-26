@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -452,6 +453,8 @@ Responda com JSON:
         self._reconciled = False  # False until exchange reconciliation confirms
         self._reconciliation_attempted = False  # True once reconciliation was attempted
         self._reconciliation_status = "SKIPPED"  # Until reconciliation runs
+        self._reconciliation_interval = self._settings.reconciliation_interval_seconds
+        self._last_reconciliation_time: float = 0.0  # time.monotonic() timestamp
         self._state: dict[str, Any] = {
             "capital": str(self.capital),
             "pnl": "0.00",
@@ -903,6 +906,28 @@ Responda com JSON:
                     d.severity.value, d.local_value, d.exchange_value, d.message,
                 )
 
+    async def _periodic_reconcile(self) -> None:
+        """Periodic reconciliation during trading session.
+
+        Non-blocking: reuses the same engine and flow as startup reconciliation.
+        If reconciliation fails, trading is blocked until next successful reconciliation.
+        """
+        logger.info("Periodic reconciliation started...")
+        try:
+            await self._reconcile_exchange()
+        except Exception as e:
+            logger.critical("Periodic reconciliation failed: %s — trading BLOCKED", e)
+            self._reconciled = False
+            self._reconciliation_status = "ERROR"
+
+        if self._reconciled:
+            logger.info("Periodic reconciliation: RECONCILED — trading continues")
+        else:
+            logger.warning(
+                "Periodic reconciliation: %s — trading BLOCKED until next successful reconciliation",
+                self._reconciliation_status,
+            )
+
     def _reload_config(self) -> None:
         """Re-read environment and rebuild configuration consistently.
 
@@ -1142,6 +1167,22 @@ Responda com JSON:
 
         # Reload config from .env.prod (settings may have changed via dashboard)
         self._reload_config()
+
+        # Periodic reconciliation (time-based, not tick-based)
+        now = time.monotonic()
+        elapsed = now - self._last_reconciliation_time
+        if (self._reconciliation_interval > 0 and
+                elapsed >= self._reconciliation_interval):
+            self._last_reconciliation_time = now
+            await self._periodic_reconcile()
+
+        # Block trading if not reconciled
+        if not self._reconciled:
+            logger.warning(
+                "Tick skipped: not reconciled (status=%s). Trading BLOCKED.",
+                self._reconciliation_status,
+            )
+            return
 
         for symbol in self.symbols:
             try:
@@ -1398,6 +1439,8 @@ Responda com JSON:
                     "quantity": str(risk_result.approved_quantity),
                     "price": str(order_result.fill_price),
                     "status": "FILLED",
+                    "fee": str(order_result.fee),
+                    "error": None,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
                 self._state["orders"].append(order_record)

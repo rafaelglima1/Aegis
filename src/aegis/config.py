@@ -177,6 +177,16 @@ class Settings(BaseSettings):
     database_echo: bool = Field(default=False, description="Database echo SQL")
     redis_url: str = Field(default="redis://localhost:6379/0", description="Redis URL")
 
+    # --- Reconciliation ---
+    reconciliation_interval_seconds: int = Field(
+        default=300,
+        validation_alias=AliasChoices(
+            "reconciliation_interval_seconds",
+            "RECONCILIATION_INTERVAL_SECONDS",
+        ),
+        description="Seconds between periodic reconciliation checks (0=disabled)",
+    )
+
     # --- Validators ---
     @field_validator("trading_environment", mode="after")
     @classmethod
