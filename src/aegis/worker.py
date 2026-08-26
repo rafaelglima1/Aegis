@@ -1009,6 +1009,119 @@ Responda com JSON:
             logger.info("Loaded prompt from file (%d chars)", len(template))
         else:
             direction = "Apenas LONG (sem SHORT)" if self.long_only else "LONG e SHORT"
+        logger.info("Config reloaded: %d symbols, max_positions=%d, risk=%.1f%%",
+                     len(self.symbols), self.max_positions, self.risk_pct * 100)
+
+    async def _poll_order_status(
+        self, order_id: Any, max_retries: int = 3, delay_seconds: float = 2.0,
+    ) -> OrderResult:
+        """Poll broker for order status after SUBMITTED.
+
+        Returns the confirmed status after polling.
+        Returns UNKNOWN if polling fails or times out.
+        """
+        from aegis.domain.enums import OrderStatus as _OS
+
+        for attempt in range(max_retries):
+            try:
+                result = await self.execution.get_order_status(order_id)
+                if result.status in (
+                    _OS.FILLED, _OS.REJECTED, _OS.CANCELLED,
+                    _OS.EXPIRED, _OS.ERROR,
+                ):
+                    return result
+                # Still SUBMITTED/PARTIALLY_FILLED — wait and retry
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(delay_seconds)
+            except Exception as e:
+                logger.warning(
+                    "Order status poll failed (attempt %d/%d): %s",
+                    attempt + 1, max_retries, e,
+                )
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(delay_seconds)
+
+        # All retries exhausted — return UNKNOWN
+        logger.warning(
+            "Order status unknown after %d retries: %s", max_retries, order_id,
+        )
+        return OrderResult(
+            order_id=order_id,
+            status=_OS.ERROR,
+            error=f"Status unknown after {max_retries} polling attempts",
+        )
+        env = _read_env_file()
+        if not env:
+            return
+
+        # Build a fresh Settings from ALL env values
+        from aegis.config import Settings, TradingEnvironment
+
+        settings_kwargs: dict[str, Any] = {}
+        if "TRADING_ENVIRONMENT" in env:
+            settings_kwargs["trading_environment"] = TradingEnvironment(env["TRADING_ENVIRONMENT"])
+        if "LIVE_ENABLED" in env:
+            settings_kwargs["live_enabled"] = env["LIVE_ENABLED"].lower() == "true"
+        if "MAX_POSITIONS" in env:
+            settings_kwargs["max_positions"] = int(env["MAX_POSITIONS"])
+
+        try:
+            new_settings = Settings(**settings_kwargs)
+            self._settings = new_settings
+            self.max_positions = new_settings.max_positions
+        except Exception:
+            # If Settings validation fails (e.g. MAX_POSITIONS > 1), skip Settings update
+            # but continue propagating other operational settings from env
+            pass
+
+        # Propagate operational settings from env (using Settings as intermediate)
+        self.symbols = env.get("TRADING_SYMBOLS", ",".join(self.symbols)).split(",")
+        self.timeframe = env.get("TRADING_TIMEFRAME", self.timeframe)
+        self.risk_pct = Decimal(env.get("RISK_PER_TRADE_PCT", str(self.risk_pct * 100))) / Decimal("100")
+        self.mandatory_stop = env.get("MANDATORY_STOP", str(self.mandatory_stop).lower()).lower() == "true"
+        self.mandatory_take_profit = env.get("MANDATORY_TAKE_PROFIT", str(self.mandatory_take_profit).lower()).lower() == "true"
+        self.long_only = env.get("LONG_ONLY", str(self.long_only).lower()).lower() == "true"
+        self.max_daily_loss_pct = Decimal(env.get("MAX_DAILY_LOSS_PCT", str(self.max_daily_loss_pct * 100))) / Decimal("100")
+        self.max_position_size_pct = Decimal(env.get("MAX_POSITION_SIZE_PCT", str(self.max_position_size_pct * 100))) / Decimal("100")
+        self.max_exposure_pct = Decimal(env.get("MAX_EXPOSURE_PCT", str(self.max_exposure_pct * 100))) / Decimal("100")
+        self.min_confidence = Decimal(env.get("MIN_CONFIDENCE", str(self.min_confidence)))
+        self.circuit_breaker_pct = Decimal(env.get("CIRCUIT_BREAKER_PCT", str(self.circuit_breaker_pct * 100))) / Decimal("100")
+
+        # C9.1: Propagate from Worker → RiskEngine (reference_capital stays unchanged)
+        self.risk_engine.limits = RiskLimits(
+            reference_capital=self.capital,
+            max_risk_per_trade_pct=self.risk_pct,
+            max_simultaneous_positions=self.max_positions,
+            circuit_breaker_drawdown_pct=self.circuit_breaker_pct,
+            max_daily_loss_pct=self.max_daily_loss_pct,
+            max_position_size_pct=self.max_position_size_pct,
+            max_exposure_pct=self.max_exposure_pct,
+        )
+
+        # Update state from Portfolio (single source of truth, not config)
+        self._state["capital"] = str(self.portfolio.cash)
+        self._state["pnl"] = str(self.portfolio.total_realized_pnl)
+        self._state["equity"] = str(self.portfolio.equity)
+        self._state["risk_limits"] = {
+            "reference_capital": str(self.capital),
+            "max_risk_per_trade_pct": str(self.risk_pct * 100),
+            "max_positions": self.max_positions,
+            "circuit_breaker_pct": str(self.circuit_breaker_pct * 100),
+            "mandatory_stop": self.mandatory_stop,
+            "mandatory_take_profit": self.mandatory_take_profit,
+            "long_only": self.long_only,
+            "min_confidence": str(self.min_confidence),
+            "max_daily_loss_pct": str(self.max_daily_loss_pct * 100),
+            "max_position_size_pct": str(self.max_position_size_pct * 100),
+            "max_exposure_pct": str(self.max_exposure_pct * 100),
+        }
+
+        # Rebuild LLM prompt from file or fallback to dynamic
+        if _PROMPT_FILE.exists():
+            template = _PROMPT_FILE.read_text(encoding="utf-8")
+            logger.info("Loaded prompt from file (%d chars)", len(template))
+        else:
+            direction = "Apenas LONG (sem SHORT)" if self.long_only else "LONG e SHORT"
             sl_tp_rules = []
             if self.mandatory_stop:
                 sl_tp_rules.append("- Stop loss obrigatório")
@@ -1373,9 +1486,10 @@ Responda com JSON:
                 risk_decision=risk_result,
             )
 
-            if order_result.fill_price:
-                # Update portfolio — AC-FIN-08: fee propagated from broker
-                from aegis.domain.enums import OrderSide
+            from aegis.domain.enums import OrderSide, OrderStatus as _OS
+
+            if order_result.status == _OS.FILLED:
+                # Fully filled — apply fill
                 self.portfolio.record_fill(
                     asset=symbol,
                     side=PositionSide.LONG,
@@ -1404,74 +1518,122 @@ Responda com JSON:
                     "opened_at": datetime.now(timezone.utc).isoformat(),
                 }
                 self._state["positions"].append(position)
-
-                # Persist immediately after position creation (persistence boundary)
                 self._save_state()
 
-                # Record position state for anti-flip-flop
                 if decision.stop_loss and decision.take_profit:
                     self.risk_engine.record_position_state(
-                        symbol=symbol,
-                        entry_price=entry,
-                        stop_loss=decision.stop_loss,
-                        take_profit=decision.take_profit,
+                        symbol=symbol, entry_price=entry,
+                        stop_loss=decision.stop_loss, take_profit=decision.take_profit,
                         thesis=decision.thesis,
                     )
-
-                # Register with position manager for BE/trailing/profit protection
-                if decision.stop_loss and decision.take_profit:
                     self.position_manager.register_position(
-                        symbol=symbol,
-                        entry_price=entry,
-                        stop_loss=decision.stop_loss,
-                        take_profit=decision.take_profit,
+                        symbol=symbol, entry_price=entry,
+                        stop_loss=decision.stop_loss, take_profit=decision.take_profit,
                         quantity=risk_result.approved_quantity,
                     )
 
-                # Record trade for cooldown and daily limits
                 self.risk_engine.record_trade(symbol)
-
-                # Record order
-                order_record = {
-                    "id": str(order_result.order_id),
-                    "symbol": symbol,
-                    "side": "BUY",
-                    "quantity": str(risk_result.approved_quantity),
-                    "price": str(order_result.fill_price),
-                    "status": "FILLED",
-                    "fee": str(order_result.fee),
-                    "error": None,
+                self._state["orders"].append({
+                    "id": str(order_result.order_id), "symbol": symbol,
+                    "side": "BUY", "quantity": str(risk_result.approved_quantity),
+                    "price": str(order_result.fill_price), "status": "FILLED",
+                    "fee": str(order_result.fee), "error": None,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-                self._state["orders"].append(order_record)
-
-                # Update risk engine
+                })
                 self.risk_engine.record_position_open()
-
-                # Update capital from Portfolio (single source of truth)
                 self._state["capital"] = str(self.portfolio.cash)
                 self._state["pnl"] = str(self.portfolio.total_realized_pnl)
+                logger.info("Order filled: %s %s @ R$ %s", risk_result.approved_quantity, symbol, order_result.fill_price)
 
-                logger.info(
-                    "Order filled: %s %s @ R$ %s",
-                    risk_result.approved_quantity,
-                    symbol,
-                    order_result.fill_price,
-                )
+            elif order_result.status in (_OS.SUBMITTED, _OS.PARTIALLY_FILLED):
+                # Not yet confirmed — poll for status
+                confirmed = await self._poll_order_status(order_result.order_id)
+                if confirmed.status == _OS.FILLED:
+                    # Re-check: if fill_price is None but status is FILLED, use approved price
+                    fill_price = confirmed.fill_price or risk_result.approved_price
+                    fill_qty = confirmed.fill_quantity or risk_result.approved_quantity
+                    self.portfolio.record_fill(
+                        asset=symbol, side=PositionSide.LONG,
+                        quantity=fill_qty, price=fill_price, fee=confirmed.fee,
+                    )
+                    entry = fill_price
+                    pnl = (current_price - entry) * fill_qty
+                    position = {
+                        "id": str(uuid4()), "symbol": symbol, "side": "LONG",
+                        "quantity": str(fill_qty), "entry_price": str(entry),
+                        "current_price": str(current_price), "entry_fee": str(confirmed.fee),
+                        "pnl": str(pnl),
+                        "pnl_pct": str((pnl / (entry * fill_qty) * 100) if entry > 0 else 0),
+                        "stop_loss": str(decision.stop_loss) if decision.stop_loss else None,
+                        "take_profit": str(decision.take_profit) if decision.take_profit else None,
+                        "thesis": decision.thesis, "status": "OPEN",
+                        "opened_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    self._state["positions"].append(position)
+                    self._save_state()
+                    self.risk_engine.record_trade(symbol)
+                    self._state["orders"].append({
+                        "id": str(confirmed.order_id), "symbol": symbol,
+                        "side": "BUY", "quantity": str(fill_qty),
+                        "price": str(fill_price), "status": "FILLED",
+                        "fee": str(confirmed.fee), "error": None,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    self.risk_engine.record_position_open()
+                    self._state["capital"] = str(self.portfolio.cash)
+                    self._state["pnl"] = str(self.portfolio.total_realized_pnl)
+                    logger.info("Order confirmed filled after poll: %s %s @ R$ %s", fill_qty, symbol, fill_price)
+
+                elif confirmed.status == _OS.PARTIALLY_FILLED:
+                    # Partial fill — record what was filled, leave remainder as UNKNOWN
+                    fill_price = confirmed.fill_price or risk_result.approved_price
+                    fill_qty = confirmed.fill_quantity or Decimal("0")
+                    if fill_qty > 0:
+                        self.portfolio.record_fill(
+                            asset=symbol, side=PositionSide.LONG,
+                            quantity=fill_qty, price=fill_price, fee=confirmed.fee,
+                        )
+                    self._state["orders"].append({
+                        "id": str(confirmed.order_id), "symbol": symbol,
+                        "side": "BUY", "quantity": str(risk_result.approved_quantity),
+                        "filled_quantity": str(fill_qty),
+                        "price": str(risk_result.approved_price),
+                        "status": "PARTIALLY_FILLED",
+                        "fee": str(confirmed.fee), "error": None,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    self._save_state()
+                    logger.warning(
+                        "Order partially filled: %s %s — filled %s of %s",
+                        symbol, confirmed.order_id, fill_qty, risk_result.approved_quantity,
+                    )
+
+                else:
+                    # REJECTED, ERROR, or UNKNOWN after polling
+                    self._state["orders"].append({
+                        "id": str(confirmed.order_id), "symbol": symbol,
+                        "side": "BUY", "quantity": str(risk_result.approved_quantity),
+                        "price": str(risk_result.approved_price),
+                        "status": confirmed.status.value,
+                        "error": confirmed.error,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    self._save_state()
+                    logger.warning(
+                        "Order not filled after poll: %s — status=%s error=%s",
+                        symbol, confirmed.status.value, confirmed.error,
+                    )
 
             else:
-                # Order not filled (REJECTED, ERROR, SUBMITTED without fill)
-                order_record = {
-                    "id": str(order_result.order_id),
-                    "symbol": symbol,
-                    "side": "BUY",
-                    "quantity": str(risk_result.approved_quantity),
+                # REJECTED, ERROR, or other terminal state — no position created
+                self._state["orders"].append({
+                    "id": str(order_result.order_id), "symbol": symbol,
+                    "side": "BUY", "quantity": str(risk_result.approved_quantity),
                     "price": str(risk_result.approved_price),
                     "status": order_result.status.value,
                     "error": order_result.error,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-                self._state["orders"].append(order_record)
+                })
                 self._save_state()
                 logger.warning(
                     "Order not filled: %s — status=%s error=%s",

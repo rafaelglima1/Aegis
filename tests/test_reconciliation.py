@@ -151,7 +151,7 @@ class TestReconciliationEngine:
         assert btc_divs[0].severity == DivergenceSeverity.CRITICAL
 
     def test_unknown_open_order(self) -> None:
-        """P1-09: Exchange order unknown locally -> WARNING."""
+        """P1-09: Exchange order unknown locally → CRITICAL divergence."""
         local = LocalSnapshot(capital=Decimal("100"))
         exchange = ExchangeSnapshot(
             status="VALID",
@@ -162,9 +162,12 @@ class TestReconciliationEngine:
         )
         engine = ReconciliationEngine()
         result = engine.reconcile(local, exchange)
-        # Warnings don't block reconciliation
-        assert result.status == ReconciliationStatus.RECONCILED
+        # Active exchange order not known locally is CRITICAL → blocks trading
+        assert result.status == ReconciliationStatus.DIVERGED
         assert len(result.divergences) >= 1
+        orphan_divs = [d for d in result.divergences if "not known locally" in d.message]
+        assert len(orphan_divs) == 1
+        assert orphan_divs[0].severity == DivergenceSeverity.CRITICAL
 
     def test_local_order_not_on_exchange(self) -> None:
         """P1-10: Local pending order not found on exchange -> WARNING."""

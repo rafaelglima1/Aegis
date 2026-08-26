@@ -301,7 +301,12 @@ class ReconciliationEngine:
         local: LocalSnapshot,
         exchange: ExchangeSnapshot,
     ) -> list[Divergence]:
-        """Compare local orders against exchange open orders."""
+        """Compare local orders against exchange open orders.
+
+        Active/open orders on exchange not known locally → CRITICAL.
+        Local SUBMITTED/PENDING orders not found on exchange → WARNING
+        (could be filled/cancelled between submission and reconciliation).
+        """
         divergences: list[Divergence] = []
 
         local_pending = {
@@ -312,7 +317,7 @@ class ReconciliationEngine:
 
         exchange_ids = {o.exchange_order_id for o in exchange.open_orders}
 
-        # Local orders not found on exchange
+        # Local orders not found on exchange — may have been filled/cancelled
         for order_id, local_order in local_pending.items():
             if order_id not in exchange_ids:
                 divergences.append(Divergence(
@@ -323,18 +328,18 @@ class ReconciliationEngine:
                     message=f"Local order {order_id} not found on exchange",
                 ))
 
-        # Exchange orders not known locally
+        # Exchange orders not known locally — CRITICAL (active order we don't know about)
         for ex_order in exchange.open_orders:
             if ex_order.exchange_order_id not in local_pending:
                 divergences.append(Divergence(
                     field=f"order_{ex_order.exchange_order_id}",
                     local_value="NOT_LOCAL",
                     exchange_value=f"{ex_order.side} {ex_order.quantity} {ex_order.symbol}",
-                    severity=DivergenceSeverity.WARNING,
+                    severity=DivergenceSeverity.CRITICAL,
                     message=(
-                        f"Exchange order {ex_order.exchange_order_id} "
+                        f"Exchange has active order {ex_order.exchange_order_id} "
                         f"({ex_order.side} {ex_order.quantity} {ex_order.symbol}) "
-                        f"not known locally"
+                        f"not known locally — trading BLOCKED"
                     ),
                 ))
 
