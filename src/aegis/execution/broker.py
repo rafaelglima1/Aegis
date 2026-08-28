@@ -72,3 +72,12 @@ class BrokerAdapter(ABC):
         Subclasses override for real implementations.
         """
         return None
+
+    async def get_order_by_exchange_id(self, exchange_order_id: str) -> OrderResult | None:
+        """Look up an order by its exchange-side identifier.
+
+        P0-09: Used to recover UNKNOWN / SUBMITTED / PARTIALLY_FILLED orders
+        that are absent from open orders. Returns the order state or None when
+        the broker cannot provide history/status lookup.
+        """
+        return None

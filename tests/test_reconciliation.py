@@ -91,9 +91,9 @@ class TestReconciliationEngine:
         assert result.status == ReconciliationStatus.DIVERGED
         assert not result.is_reconciled
         assert len(result.divergences) >= 1
-        capital_div = [d for d in result.divergences if d.field == "capital"]
-        assert len(capital_div) == 1
-        assert capital_div[0].severity == DivergenceSeverity.CRITICAL
+        brl_div = [d for d in result.divergences if d.field == "cash_brl"]
+        assert len(brl_div) == 1
+        assert brl_div[0].severity == DivergenceSeverity.CRITICAL
 
     def test_unknown_exchange_blocks_trading(self) -> None:
         """P1-03/P1-13: Unknown exchange -> UNKNOWN."""
@@ -170,7 +170,7 @@ class TestReconciliationEngine:
         assert orphan_divs[0].severity == DivergenceSeverity.CRITICAL
 
     def test_local_order_not_on_exchange(self) -> None:
-        """P1-10: Local pending order not found on exchange -> WARNING."""
+        """P0-09: Local pending order not found on exchange -> UNKNOWN (not assumed resolved)."""
         local = LocalSnapshot(
             capital=Decimal("100"),
             orders=[LocalOrder("local-123", "BTC-BRL", "BUY", Decimal("0.001"), "SUBMITTED")],
@@ -181,9 +181,11 @@ class TestReconciliationEngine:
         )
         engine = ReconciliationEngine()
         result = engine.reconcile(local, exchange)
-        assert result.status == ReconciliationStatus.RECONCILED
-        order_divs = [d for d in result.divergences if "local-123" in d.field]
-        assert len(order_divs) == 1
+        # A pending order missing from open orders is NOT assumed non-existent.
+        # Without order-history evidence we cannot determine its state → UNKNOWN.
+        assert result.status == ReconciliationStatus.UNKNOWN
+        assert not result.is_reconciled
+        assert result.error is not None and "local-123" in result.error
 
     def test_no_secrets_in_result(self) -> None:
         """P1-17: No secrets in reconciliation result."""

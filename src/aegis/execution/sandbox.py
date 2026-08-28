@@ -41,10 +41,38 @@ class SandboxBroker(BrokerAdapter):
         self._orders: dict[UUID, SandboxOrder] = {}
         self._idempotency_keys: set[UUID] = set()
         self._slippage_bps = Decimal("0.001")
+        # P0-02: configurable cumulative fill sequences for partial-fill tests
+        self._pending_fills: dict[UUID, list[Decimal]] = {}
 
     @property
     def balance(self) -> Decimal:
         return self._balance
+
+    def configure_partial_fills(self, order_id: UUID, sequence: list[Decimal]) -> None:
+        """Configure a cumulative fill sequence for an order.
+
+        Each element is the cumulative filled quantity reported to the caller
+        on successive polls (e.g. [0.30, 0.60, 1.00]). Used to exercise the
+        PARTIALLY_FILLED → PARTIALLY_FILLED → FILLED production path.
+        """
+        self._pending_fills[order_id] = [Decimal(q) for q in sequence]
+
+    def _advance_partial_fill(self, order: SandboxOrder) -> None:
+        """Advance an order's cumulative fill by one step."""
+        remaining = self._pending_fills.get(order.order_id)
+        if not remaining:
+            return
+        next_fill = remaining[0]
+        self._pending_fills[order.order_id] = remaining[1:]
+        prev_fill = order.fill_quantity or Decimal("0")
+        delta = next_fill - prev_fill
+        if order.fill_price is not None:
+            self._balance -= order.fill_price * delta
+        order.fill_quantity = next_fill
+        if next_fill >= order.quantity:
+            order.status = OrderStatus.FILLED
+        else:
+            order.status = OrderStatus.PARTIALLY_FILLED
 
     async def submit_order(self, submission: OrderSubmission) -> OrderResult:
         """AC-08.03: Order submission works in Sandbox.
@@ -156,6 +184,52 @@ class SandboxBroker(BrokerAdapter):
                     error="Insufficient balance",
                 )
 
+            # P0-02: Support partial-fill simulation
+            if submission.order_id in self._pending_fills:
+                sequence = self._pending_fills[submission.order_id]
+                first_fill = sequence[0] if sequence else Decimal("0")
+                first_cost = fill_price * first_fill
+                if self._balance < first_cost + fee:
+                    order = SandboxOrder(
+                        order_id=submission.order_id,
+                        idempotency_key=submission.idempotency_key,
+                        symbol=submission.symbol,
+                        side=submission.side,
+                        quantity=submission.quantity,
+                        price=submission.price,
+                        status=OrderStatus.REJECTED,
+                    )
+                    self._orders[submission.order_id] = order
+                    return OrderResult(
+                        order_id=submission.order_id,
+                        status=OrderStatus.REJECTED,
+                        error="Insufficient balance",
+                    )
+                self._balance -= first_cost + fee
+                order = SandboxOrder(
+                    order_id=submission.order_id,
+                    idempotency_key=submission.idempotency_key,
+                    symbol=submission.symbol,
+                    side=submission.side,
+                    quantity=submission.quantity,
+                    price=submission.price,
+                    status=OrderStatus.PARTIALLY_FILLED,
+                    fill_price=fill_price,
+                    fill_quantity=first_fill,
+                    fee=fee,
+                )
+                self._orders[submission.order_id] = order
+                # Advance the sequence so next poll sees the next cumulative value
+                self._pending_fills[submission.order_id] = sequence[1:]
+
+                return OrderResult(
+                    order_id=submission.order_id,
+                    status=OrderStatus.PARTIALLY_FILLED,
+                    fill_price=fill_price,
+                    fill_quantity=first_fill,
+                    fee=fee,
+                )
+
             order = SandboxOrder(
                 order_id=submission.order_id,
                 idempotency_key=submission.idempotency_key,
@@ -200,7 +274,8 @@ class SandboxBroker(BrokerAdapter):
         return CancelResult(order_id=order_id, success=True)
 
     async def get_order_status(self, order_id: UUID) -> OrderResult:
-        """AC-08.05: Order status retrieval works."""
+        """AC-08.05: Order status retrieval works.
+        P0-02: Advances partial-fill sequence on each poll."""
         order = self._orders.get(order_id)
         if not order:
             return OrderResult(
@@ -208,6 +283,11 @@ class SandboxBroker(BrokerAdapter):
                 status=OrderStatus.REJECTED,
                 error="Order not found",
             )
+
+        # P0-02: Advance partial fill if configured
+        if order_id in self._pending_fills and self._pending_fills[order_id]:
+            self._advance_partial_fill(order)
+
         return OrderResult(
             order_id=order.order_id,
             status=order.status,
@@ -218,10 +298,11 @@ class SandboxBroker(BrokerAdapter):
 
     async def get_position(self, symbol: str) -> dict[str, Any]:
         """Get current net position for a symbol.
-        C6-04: BUY adds, SELL subtracts."""
+        C6-04: BUY adds, SELL subtracts.
+        P0-01: PARTIALLY_FILLED orders contribute their executed quantity."""
         filled = [
             o for o in self._orders.values()
-            if o.symbol == symbol and o.status == OrderStatus.FILLED
+            if o.symbol == symbol and o.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)
         ]
         total_qty = Decimal("0")
         for o in filled:
@@ -234,6 +315,8 @@ class SandboxBroker(BrokerAdapter):
 
     async def get_exchange_snapshot(self) -> Any:
         """Get sandbox state as ExchangeSnapshot for reconciliation."""
+        from datetime import datetime, timezone
+
         from aegis.reconciliation import ExchangeSnapshot, ExchangeBalance, ExchangeOrder
 
         balances = [
@@ -247,7 +330,7 @@ class SandboxBroker(BrokerAdapter):
         # Derive crypto balances from filled orders
         crypto_balances: dict[str, Decimal] = {}
         for o in self._orders.values():
-            if o.status != OrderStatus.FILLED:
+            if o.status not in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
                 continue
             coin = o.symbol.split("-")[0]
             qty = o.fill_quantity or Decimal("0")
@@ -264,7 +347,9 @@ class SandboxBroker(BrokerAdapter):
 
         open_orders = []
         for o in self._orders.values():
-            if o.status in (OrderStatus.SUBMITTED, OrderStatus.ACKNOWLEDGED):
+            if o.status in (
+                OrderStatus.SUBMITTED, OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED,
+            ):
                 open_orders.append(ExchangeOrder(
                     exchange_order_id=str(o.order_id),
                     symbol=o.symbol,
@@ -279,4 +364,5 @@ class SandboxBroker(BrokerAdapter):
             status="VALID",
             balances=balances,
             open_orders=open_orders,
+            timestamp=datetime.now(timezone.utc).isoformat(),
         )

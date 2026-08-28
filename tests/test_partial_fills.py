@@ -158,8 +158,8 @@ class TestOrphanOrders:
         assert len(orphan_divs) == 1
         assert orphan_divs[0].severity == DivergenceSeverity.CRITICAL
 
-    def test_local_order_not_on_exchange_is_warning(self) -> None:
-        """Local SUBMITTED order not on exchange → WARNING (may be filled)."""
+    def test_local_order_not_on_exchange_is_unknown(self) -> None:
+        """P0-09: Local SUBMITTED order not on exchange → UNKNOWN (blocks trading)."""
         engine = ReconciliationEngine()
         local = LocalSnapshot(
             capital=Decimal("100"),
@@ -170,8 +170,10 @@ class TestOrphanOrders:
             balances=[ExchangeBalance("BRL", Decimal("100"), Decimal("0"))],
         )
         result = engine.reconcile(local, exchange)
-        assert result.is_reconciled  # WARNING only, not CRITICAL
-        assert any("not found on exchange" in d.message for d in result.divergences)
+        # A pending order missing from open orders is NOT assumed non-existent.
+        # Without order-history evidence the state cannot be determined safely.
+        assert not result.is_reconciled
+        assert result.status == ReconciliationStatus.UNKNOWN
 
 
 # ============================================================

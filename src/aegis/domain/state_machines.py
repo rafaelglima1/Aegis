@@ -21,14 +21,22 @@ class InvalidStateTransition(Exception):
 #   SUBMITTED -> ACKNOWLEDGED
 #   ACKNOWLEDGED -> PARTIALLY_FILLED
 #   PARTIALLY_FILLED -> FILLED
+#   ANY_NON_TERMINAL -> UNKNOWN  (confirmation timeout)
+#   UNKNOWN -> FILLED | PARTIALLY_FILLED | SUBMITTED | REJECTED | CANCELLED | ERROR
 # Terminal states: CANCELLED, REJECTED, EXPIRED, ERROR
 ORDER_VALID_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
-    OrderStatus.CREATED: {OrderStatus.SUBMITTED, OrderStatus.CANCELLED, OrderStatus.REJECTED},
+    OrderStatus.CREATED: {
+        OrderStatus.SUBMITTED,
+        OrderStatus.CANCELLED,
+        OrderStatus.REJECTED,
+        OrderStatus.UNKNOWN,
+    },
     OrderStatus.SUBMITTED: {
         OrderStatus.ACKNOWLEDGED,
         OrderStatus.CANCELLED,
         OrderStatus.REJECTED,
         OrderStatus.ERROR,
+        OrderStatus.UNKNOWN,
     },
     OrderStatus.ACKNOWLEDGED: {
         OrderStatus.PARTIALLY_FILLED,
@@ -36,10 +44,21 @@ ORDER_VALID_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
         OrderStatus.CANCELLED,
         OrderStatus.REJECTED,
         OrderStatus.ERROR,
+        OrderStatus.UNKNOWN,
     },
     OrderStatus.PARTIALLY_FILLED: {
         OrderStatus.FILLED,
         OrderStatus.CANCELLED,
+        OrderStatus.ERROR,
+        OrderStatus.UNKNOWN,
+    },
+    OrderStatus.UNKNOWN: {
+        OrderStatus.FILLED,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.SUBMITTED,
+        OrderStatus.ACKNOWLEDGED,
+        OrderStatus.CANCELLED,
+        OrderStatus.REJECTED,
         OrderStatus.ERROR,
     },
     OrderStatus.FILLED: set(),

@@ -288,9 +288,9 @@ class TestTimeoutSafety:
 class TestOrderExchangeComparison:
 
     def test_local_order_not_on_exchange(self) -> None:
-        """Local SUBMITTED order not found on exchange → WARNING."""
+        """P0-09: Local SUBMITTED order not found on exchange → UNKNOWN (not assumed resolved)."""
         from aegis.reconciliation import (
-            ReconciliationEngine, LocalSnapshot, LocalOrder,
+            ReconciliationEngine, ReconciliationStatus, LocalSnapshot, LocalOrder,
         )
         local = LocalSnapshot(
             capital=Decimal("100"),
@@ -301,9 +301,10 @@ class TestOrderExchangeComparison:
         ])
         engine = ReconciliationEngine()
         result = engine.reconcile(local, exchange)
-        # Warnings don't block reconciliation
-        assert result.is_reconciled
-        assert len(result.divergences) >= 1
+        # A pending order missing from open orders is NOT assumed non-existent.
+        # Without order-history evidence the state cannot be determined safely.
+        assert result.status == ReconciliationStatus.UNKNOWN
+        assert not result.is_reconciled
 
     def test_exchange_order_not_local(self) -> None:
         """Exchange order not known locally → CRITICAL (blocks trading)."""
@@ -568,9 +569,9 @@ class TestCrashRecovery:
         assert any("not known locally" in d.message for d in result.divergences)
 
     def test_local_order_missing_on_exchange(self) -> None:
-        """AC11: Local order not on exchange → divergence."""
+        """P0-09: Local order not on exchange → UNKNOWN (cannot determine safely)."""
         from aegis.reconciliation import (
-            ReconciliationEngine, LocalSnapshot, ExchangeSnapshot,
+            ReconciliationEngine, ReconciliationStatus, LocalSnapshot, ExchangeSnapshot,
             ExchangeBalance, LocalOrder,
         )
 
@@ -584,4 +585,6 @@ class TestCrashRecovery:
         )
         engine = ReconciliationEngine()
         result = engine.reconcile(local, exchange)
-        assert any("not found on exchange" in d.message for d in result.divergences)
+        assert result.status == ReconciliationStatus.UNKNOWN
+        assert not result.is_reconciled
+        assert result.error is not None and "local-orphan" in result.error

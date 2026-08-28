@@ -25,6 +25,7 @@ class OrderStatus(str, Enum):
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
     ERROR = "ERROR"
+    UNKNOWN = "UNKNOWN"
 
 
 class PositionSide(str, Enum):

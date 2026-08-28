@@ -25,6 +25,7 @@ from aegis.risk_engine.setup_scorer import SetupScorer, SetupWeights
 from aegis.risk_engine.position_manager import PositionManager, PositionManagerConfig
 from aegis.risk_engine.trade_journal import TradeJournal, TradeRecord
 from aegis.execution.engine import ExecutionEngine
+from aegis.execution.broker import OrderResult
 from aegis.portfolio.portfolio import Portfolio
 from aegis.audit import AuditLogger
 
@@ -844,13 +845,16 @@ Responda com JSON:
 
         local_orders = []
         for order in self._state.get("orders", []):
-            if order.get("status") in ("SUBMITTED", "PENDING"):
+            if order.get("status") in ("SUBMITTED", "PARTIALLY_FILLED", "UNKNOWN", "ACKNOWLEDGED", "PENDING"):
                 local_orders.append(LocalOrder(
                     local_order_id=order.get("id", ""),
                     symbol=order.get("symbol", ""),
                     side=order.get("side", ""),
                     quantity=Decimal(order.get("quantity", "0")),
                     status=order.get("status", ""),
+                    filled_quantity=Decimal(order.get("filled_quantity", "0")),
+                    remaining_quantity=Decimal(order.get("remaining_quantity", "0")),
+                    exchange_order_id=order.get("exchange_order_id", ""),
                 ))
 
         local_snapshot = LocalSnapshot(
@@ -858,6 +862,10 @@ Responda com JSON:
             positions=local_positions,
             orders=local_orders,
             state_valid=self._state_valid,
+            cash_locked=Decimal("0"),
+            realized_pnl=self.portfolio.total_realized_pnl,
+            unrealized_pnl=self.portfolio.unrealized_pnl,
+            equity=self.portfolio.equity,
         )
 
         # Get exchange snapshot
@@ -928,90 +936,6 @@ Responda com JSON:
                 self._reconciliation_status,
             )
 
-    def _reload_config(self) -> None:
-        """Re-read environment and rebuild configuration consistently.
-
-        AC1: All config flows through Settings. No direct file reads for operational params.
-        C9.2-02: TRADING_ENVIRONMENT and LIVE_ENABLED are stored in self._settings
-            but do NOT trigger broker recreation. Changing TRADING_ENVIRONMENT
-            requires a full process restart for the broker to be swapped.
-            Hot-reload only propagates max_positions and operational settings.
-        """
-        env = _read_env_file()
-        if not env:
-            return
-
-        # Build a fresh Settings from ALL env values
-        from aegis.config import Settings, TradingEnvironment
-
-        settings_kwargs: dict[str, Any] = {}
-        if "TRADING_ENVIRONMENT" in env:
-            settings_kwargs["trading_environment"] = TradingEnvironment(env["TRADING_ENVIRONMENT"])
-        if "LIVE_ENABLED" in env:
-            settings_kwargs["live_enabled"] = env["LIVE_ENABLED"].lower() == "true"
-        if "MAX_POSITIONS" in env:
-            settings_kwargs["max_positions"] = int(env["MAX_POSITIONS"])
-
-        try:
-            new_settings = Settings(**settings_kwargs)
-            self._settings = new_settings
-            self.max_positions = new_settings.max_positions
-        except Exception:
-            # If Settings validation fails (e.g. MAX_POSITIONS > 1), skip Settings update
-            # but continue propagating other operational settings from env
-            pass
-
-        # Propagate operational settings from env (using Settings as intermediate)
-        self.symbols = env.get("TRADING_SYMBOLS", ",".join(self.symbols)).split(",")
-        self.timeframe = env.get("TRADING_TIMEFRAME", self.timeframe)
-        self.risk_pct = Decimal(env.get("RISK_PER_TRADE_PCT", str(self.risk_pct * 100))) / Decimal("100")
-        self.mandatory_stop = env.get("MANDATORY_STOP", str(self.mandatory_stop).lower()).lower() == "true"
-        self.mandatory_take_profit = env.get("MANDATORY_TAKE_PROFIT", str(self.mandatory_take_profit).lower()).lower() == "true"
-        self.long_only = env.get("LONG_ONLY", str(self.long_only).lower()).lower() == "true"
-        self.max_daily_loss_pct = Decimal(env.get("MAX_DAILY_LOSS_PCT", str(self.max_daily_loss_pct * 100))) / Decimal("100")
-        self.max_position_size_pct = Decimal(env.get("MAX_POSITION_SIZE_PCT", str(self.max_position_size_pct * 100))) / Decimal("100")
-        self.max_exposure_pct = Decimal(env.get("MAX_EXPOSURE_PCT", str(self.max_exposure_pct * 100))) / Decimal("100")
-        self.min_confidence = Decimal(env.get("MIN_CONFIDENCE", str(self.min_confidence)))
-        self.circuit_breaker_pct = Decimal(env.get("CIRCUIT_BREAKER_PCT", str(self.circuit_breaker_pct * 100))) / Decimal("100")
-
-        # C9.1: Propagate from Worker → RiskEngine (reference_capital stays unchanged)
-        self.risk_engine.limits = RiskLimits(
-            reference_capital=self.capital,
-            max_risk_per_trade_pct=self.risk_pct,
-            max_simultaneous_positions=self.max_positions,
-            circuit_breaker_drawdown_pct=self.circuit_breaker_pct,
-            max_daily_loss_pct=self.max_daily_loss_pct,
-            max_position_size_pct=self.max_position_size_pct,
-            max_exposure_pct=self.max_exposure_pct,
-        )
-
-        # Update state from Portfolio (single source of truth, not config)
-        self._state["capital"] = str(self.portfolio.cash)
-        self._state["pnl"] = str(self.portfolio.total_realized_pnl)
-        self._state["equity"] = str(self.portfolio.equity)
-        self._state["risk_limits"] = {
-            "reference_capital": str(self.capital),
-            "max_risk_per_trade_pct": str(self.risk_pct * 100),
-            "max_positions": self.max_positions,
-            "circuit_breaker_pct": str(self.circuit_breaker_pct * 100),
-            "mandatory_stop": self.mandatory_stop,
-            "mandatory_take_profit": self.mandatory_take_profit,
-            "long_only": self.long_only,
-            "min_confidence": str(self.min_confidence),
-            "max_daily_loss_pct": str(self.max_daily_loss_pct * 100),
-            "max_position_size_pct": str(self.max_position_size_pct * 100),
-            "max_exposure_pct": str(self.max_exposure_pct * 100),
-        }
-
-        # Rebuild LLM prompt from file or fallback to dynamic
-        if _PROMPT_FILE.exists():
-            template = _PROMPT_FILE.read_text(encoding="utf-8")
-            logger.info("Loaded prompt from file (%d chars)", len(template))
-        else:
-            direction = "Apenas LONG (sem SHORT)" if self.long_only else "LONG e SHORT"
-        logger.info("Config reloaded: %d symbols, max_positions=%d, risk=%.1f%%",
-                     len(self.symbols), self.max_positions, self.risk_pct * 100)
-
     async def _poll_order_status(
         self, order_id: Any, max_retries: int = 3, delay_seconds: float = 2.0,
     ) -> OrderResult:
@@ -1041,13 +965,13 @@ Responda com JSON:
                 if attempt < max_retries - 1:
                     await asyncio.sleep(delay_seconds)
 
-        # All retries exhausted — return UNKNOWN
+        # All retries exhausted — return UNKNOWN (not ERROR)
         logger.warning(
             "Order status unknown after %d retries: %s", max_retries, order_id,
         )
         return OrderResult(
             order_id=order_id,
-            status=_OS.ERROR,
+            status=_OS.UNKNOWN,
             error=f"Status unknown after {max_retries} polling attempts",
         )
 
@@ -1118,6 +1042,60 @@ Responda com JSON:
             logger.info("Loaded prompt from file (%d chars)", len(template))
         else:
             direction = "Apenas LONG (sem SHORT)" if self.long_only else "LONG e SHORT"
+            sl_tp_rules = []
+            if self.mandatory_stop:
+                sl_tp_rules.append("- Stop loss obrigatorio")
+            else:
+                sl_tp_rules.append("- Stop loss opcional")
+            if self.mandatory_take_profit:
+                sl_tp_rules.append("- Take profit obrigatorio")
+            else:
+                sl_tp_rules.append("- Take profit opcional")
+            _rules = "\n".join(sl_tp_rules)
+            _risk = self.risk_pct * 100
+            _cap = self.capital
+            _conf = self.min_confidence * 100
+            _daily = self.max_daily_loss_pct * 100
+            _pos_sz = self.max_position_size_pct * 100
+            template = (
+                "Voce e um trader de swing trade de criptomoedas profissional.\n"
+                "Analise os dados de mercado e tome uma decisao de trading.\n"
+                "\n"
+                "DADOS DE MERCADO:\n"
+                "{market_state}\n"
+                "\n"
+                "PORTFOLIO ATUAL:\n"
+                "{portfolio}\n"
+                "\n"
+                "REGRA: {direction}\n"
+                "{_rules}\n"
+                "\n"
+                "PARAMETROS:\n"
+                f"- Risco por trade: {_risk:.1f}%\n"
+                f"- Capital: R$ {_cap}\n"
+                f"- Confianca minima: {_conf:.0f}%\n"
+                f"- Perda maxima diaria: {_daily:.1f}%\n"
+                f"- Tamanho maximo posicao: {_pos_sz:.1f}%\n"
+                "\n"
+                "Responda APENAS com JSON valido:\n"
+                "{{\n"
+                '    "action": "LONG" ou "HOLD" ou "CLOSE",\n'
+                '    "confidence": 0.0 a 1.0,\n'
+                '    "thesis": "raciocinio breve",\n'
+                '    "entry_price": numero ou null,\n'
+                '    "stop_loss": numero ou null,\n'
+                '    "take_profit": numero ou null,\n'
+                '    "reasoning": "analise detalhada"\n'
+                "}}\n"
+            )
+
+        self.prompt_manager.register(
+            PromptVersion(
+                version="trading_v1",
+                template=template,
+                description="Auto-reloaded prompt from _reload_config",
+            )
+        )
         logger.info("Config reloaded: %d symbols, max_positions=%d, risk=%.1f%%",
                      len(self.symbols), self.max_positions, self.risk_pct * 100)
 
@@ -1259,6 +1237,179 @@ Responda com JSON:
             pos["pnl"] = str(unrealized)
             pos["pnl_pct"] = str((unrealized / (entry * qty) * 100) if entry > 0 and qty > 0 else 0)
 
+    def _find_pending_order(self, symbol: str) -> dict[str, Any] | None:
+        """Find an existing non-terminal order for a symbol.
+
+        P0-09/P0-10: SUBMITTED / PARTIALLY_FILLED / UNKNOWN orders must be
+        reconciled before a new order is created. This prevents UNKNOWN →
+        duplicate order retry after restart.
+        """
+        for order in self._state["orders"]:
+            if (order.get("symbol") == symbol
+                    and order.get("status") in ("SUBMITTED", "PARTIALLY_FILLED", "UNKNOWN", "ACKNOWLEDGED")):
+                return order
+        return None
+
+    def _find_open_position(self, symbol: str) -> dict[str, Any] | None:
+        """Find the open position record for a symbol."""
+        for pos in self._state["positions"]:
+            if pos.get("symbol") == symbol and pos.get("status") == "OPEN":
+                return pos
+        return None
+
+    def _upsert_position(
+        self,
+        symbol: str,
+        delta_qty: Decimal,
+        fill_price: Decimal,
+        current_price: Decimal,
+        fee: Decimal,
+        decision: Any,
+    ) -> dict[str, Any]:
+        """Create or update the local position record to reflect executed qty.
+
+        P0-03: position.quantity must match the effectively executed quantity.
+        The delta from each fill is accumulated; entry_price is synced from the
+        Portfolio average_entry (single source of truth).
+        """
+        pos = self._find_open_position(symbol)
+        if pos is None:
+            pos = {
+                "id": str(uuid4()), "symbol": symbol, "side": "LONG",
+                "quantity": "0", "entry_price": str(fill_price),
+                "current_price": str(current_price), "entry_fee": str(fee),
+                "pnl": "0", "pnl_pct": "0",
+                "stop_loss": str(decision.stop_loss) if decision.stop_loss else None,
+                "take_profit": str(decision.take_profit) if decision.take_profit else None,
+                "thesis": decision.thesis, "status": "OPEN",
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._state["positions"].append(pos)
+
+        qty = Decimal(pos["quantity"]) + delta_qty
+        pos["quantity"] = str(qty)
+        pos["current_price"] = str(current_price)
+        pos["entry_fee"] = str(fee)
+
+        portfolio_pos = self.portfolio._positions.get(symbol)
+        if portfolio_pos and portfolio_pos.quantity > 0:
+            pos["entry_price"] = str(portfolio_pos.average_entry)
+
+        entry = Decimal(pos["entry_price"])
+        pnl = (current_price - entry) * qty
+        pos["pnl"] = str(pnl)
+        pos["pnl_pct"] = str((pnl / (entry * qty) * 100) if entry > 0 and qty > 0 else 0)
+        return pos
+
+    def _apply_fill_delta(
+        self,
+        order_record: dict[str, Any],
+        symbol: str,
+        new_filled: Decimal,
+        fill_price: Decimal,
+        fee: Decimal,
+        decision: Any,
+        current_price: Decimal,
+    ) -> Decimal:
+        """Apply only the delta between previously filled and new filled.
+
+        P0-01/P0-02: fill accounting is idempotent. delta = new - previous.
+        Never records the cumulative fill twice.
+        """
+        requested = Decimal(order_record.get("quantity", "0"))
+        prev_filled = Decimal(order_record.get("filled_quantity", "0"))
+        delta = new_filled - prev_filled
+        if delta < 0:
+            logger.error(
+                "Fill regression on order %s: previous=%s new=%s — ignoring delta",
+                order_record.get("id"), prev_filled, new_filled,
+            )
+            delta = Decimal("0")
+        if delta > 0:
+            self.portfolio.record_fill(
+                asset=symbol,
+                side=PositionSide.LONG,
+                quantity=delta,
+                price=fill_price,
+                fee=fee,
+            )
+            self._upsert_position(symbol, delta, fill_price, current_price, fee, decision)
+        order_record["filled_quantity"] = str(new_filled)
+        order_record["remaining_quantity"] = str(requested - new_filled)
+        order_record["fee"] = str(fee)
+        order_record["timestamp"] = datetime.now(timezone.utc).isoformat()
+        return delta
+
+    async def _reconcile_pending_order(
+        self,
+        order_record: dict[str, Any],
+        symbol: str,
+        decision: Any,
+        current_price: Decimal,
+    ) -> str:
+        """Poll and reconcile an existing pending order (P0-09/P0-10).
+
+        Continues from the already-executed state. Accounts only the delta.
+        Returns the final order status string.
+        """
+        from aegis.domain.enums import OrderStatus as _OS
+        from uuid import UUID as _UUID
+
+        try:
+            order_id = _UUID(order_record["id"])
+        except (ValueError, KeyError) as e:
+            logger.critical("Cannot recover order %s: %s — UNKNOWN", order_record.get("id"), e)
+            order_record["status"] = "UNKNOWN"
+            self._reconciled = False
+            self._save_state()
+            return "UNKNOWN"
+
+        confirmed = await self._poll_order_status(order_id)
+        requested = Decimal(order_record.get("quantity", "0"))
+        prev_filled = Decimal(order_record.get("filled_quantity", "0"))
+        default_price = Decimal(order_record.get("price", "0"))
+
+        if confirmed.status == _OS.FILLED:
+            new_filled = confirmed.fill_quantity or requested
+            fill_price = confirmed.fill_price or default_price
+            self._apply_fill_delta(order_record, symbol, new_filled, fill_price, confirmed.fee, decision, current_price)
+            order_record["status"] = "FILLED"
+            order_record["remaining_quantity"] = "0"
+            order_record["error"] = None
+            self.risk_engine.record_trade(symbol)
+            self.risk_engine.record_position_open()
+            self._save_state()
+            logger.info("Order recovered FILLED: %s %s @ R$ %s (delta %s)", symbol, new_filled, fill_price, new_filled - prev_filled)
+            return "FILLED"
+
+        if confirmed.status == _OS.PARTIALLY_FILLED:
+            new_filled = confirmed.fill_quantity or prev_filled
+            fill_price = confirmed.fill_price or default_price
+            self._apply_fill_delta(order_record, symbol, new_filled, fill_price, confirmed.fee, decision, current_price)
+            order_record["status"] = "PARTIALLY_FILLED"
+            order_record["error"] = None
+            self._save_state()
+            logger.info("Order still PARTIALLY_FILLED: %s filled %s of %s", symbol, new_filled, requested)
+            return "PARTIALLY_FILLED"
+
+        if confirmed.status in (_OS.REJECTED, _OS.CANCELLED, _OS.EXPIRED):
+            order_record["status"] = confirmed.status.value
+            order_record["error"] = confirmed.error
+            self._save_state()
+            logger.warning("Order resolved %s: %s", confirmed.status.value, symbol)
+            return confirmed.status.value
+
+        # P0-05/P0-13: UNKNOWN/ERROR while polling → fail-safe
+        logger.critical(
+            "Order status unknown for %s (%s) — UNKNOWN. Trading BLOCKED.",
+            symbol, order_record.get("id"),
+        )
+        order_record["status"] = "UNKNOWN"
+        order_record["error"] = confirmed.error or "Status unknown after polling"
+        self._reconciled = False
+        self._save_state()
+        return "UNKNOWN"
+
     async def _process_symbol(self, symbol: str) -> None:
         """Process a single trading symbol with deterministic risk validation."""
         logger.info("Processing %s...", symbol)
@@ -1390,165 +1541,109 @@ Responda com JSON:
 
         # 7. Execute trade
         if decision.action == TradingAction.LONG:
+            from aegis.domain.enums import OrderSide, OrderStatus as _OS
+
+            # P0-09/P0-10: If there is an existing non-terminal order for this
+            # symbol, reconcile it instead of creating a duplicate order.
+            pending = self._find_pending_order(symbol)
+            if pending is not None:
+                logger.warning(
+                    "Existing pending order %s for %s — reconciling before any new order",
+                    pending.get("id"), symbol,
+                )
+                await self._reconcile_pending_order(pending, symbol, decision, current_price)
+                return
+
+            order_id = uuid4()
+            idempotency_key = uuid4()
             order_result = await self.execution.execute_order(
-                order_id=uuid4(),
-                idempotency_key=uuid4(),
+                order_id=order_id,
+                idempotency_key=idempotency_key,
                 symbol=symbol,
-                side=__import__("aegis.domain.enums", fromlist=["OrderSide"]).OrderSide.BUY,
+                side=OrderSide.BUY,
                 quantity=risk_result.approved_quantity,
                 price=risk_result.approved_price,
                 correlation_id=decision.correlation_id,
                 risk_decision=risk_result,
             )
 
-            from aegis.domain.enums import OrderSide, OrderStatus as _OS
+            # P0-12: Persist the order record immediately on every transition.
+            order_record = {
+                "id": str(order_id),
+                "idempotency_key": str(idempotency_key),
+                "symbol": symbol,
+                "side": "BUY",
+                "quantity": str(risk_result.approved_quantity),
+                "price": str(risk_result.approved_price),
+                "status": order_result.status.value,
+                "filled_quantity": str(order_result.fill_quantity or Decimal("0")),
+                "remaining_quantity": str(risk_result.approved_quantity - (order_result.fill_quantity or Decimal("0"))),
+                "fee": str(order_result.fee),
+                "error": order_result.error,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self._state["orders"].append(order_record)
 
             if order_result.status == _OS.FILLED:
-                # Fully filled — apply fill
-                self.portfolio.record_fill(
-                    asset=symbol,
-                    side=PositionSide.LONG,
-                    quantity=risk_result.approved_quantity,
-                    price=order_result.fill_price,
-                    fee=order_result.fee,
+                # P0-01: full fill — apply delta from 0 (idempotent)
+                fill_price = order_result.fill_price or risk_result.approved_price
+                new_filled = order_result.fill_quantity or risk_result.approved_quantity
+                self._apply_fill_delta(
+                    order_record, symbol, new_filled, fill_price,
+                    order_result.fee, decision, current_price,
                 )
-
-                # Record position
-                entry = order_result.fill_price
-                pnl = (current_price - entry) * risk_result.approved_quantity
-                position = {
-                    "id": str(uuid4()),
-                    "symbol": symbol,
-                    "side": "LONG",
-                    "quantity": str(risk_result.approved_quantity),
-                    "entry_price": str(entry),
-                    "current_price": str(current_price),
-                    "entry_fee": str(order_result.fee),
-                    "pnl": str(pnl),
-                    "pnl_pct": str((pnl / (entry * risk_result.approved_quantity) * 100) if entry > 0 else 0),
-                    "stop_loss": str(decision.stop_loss) if decision.stop_loss else None,
-                    "take_profit": str(decision.take_profit) if decision.take_profit else None,
-                    "thesis": decision.thesis,
-                    "status": "OPEN",
-                    "opened_at": datetime.now(timezone.utc).isoformat(),
-                }
-                self._state["positions"].append(position)
+                order_record["status"] = "FILLED"
+                order_record["remaining_quantity"] = "0"
+                order_record["error"] = None
+                self.risk_engine.record_trade(symbol)
+                self.risk_engine.record_position_open()
                 self._save_state()
 
                 if decision.stop_loss and decision.take_profit:
                     self.risk_engine.record_position_state(
-                        symbol=symbol, entry_price=entry,
+                        symbol=symbol, entry_price=fill_price,
                         stop_loss=decision.stop_loss, take_profit=decision.take_profit,
                         thesis=decision.thesis,
                     )
                     self.position_manager.register_position(
-                        symbol=symbol, entry_price=entry,
+                        symbol=symbol, entry_price=fill_price,
                         stop_loss=decision.stop_loss, take_profit=decision.take_profit,
-                        quantity=risk_result.approved_quantity,
+                        quantity=new_filled,
                     )
 
-                self.risk_engine.record_trade(symbol)
-                self._state["orders"].append({
-                    "id": str(order_result.order_id), "symbol": symbol,
-                    "side": "BUY", "quantity": str(risk_result.approved_quantity),
-                    "price": str(order_result.fill_price), "status": "FILLED",
-                    "fee": str(order_result.fee), "error": None,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-                self.risk_engine.record_position_open()
                 self._state["capital"] = str(self.portfolio.cash)
                 self._state["pnl"] = str(self.portfolio.total_realized_pnl)
-                logger.info("Order filled: %s %s @ R$ %s", risk_result.approved_quantity, symbol, order_result.fill_price)
+                logger.info("Order filled: %s %s @ R$ %s", new_filled, symbol, fill_price)
 
-            elif order_result.status in (_OS.SUBMITTED, _OS.PARTIALLY_FILLED):
-                # Not yet confirmed — poll for status
-                confirmed = await self._poll_order_status(order_result.order_id)
-                if confirmed.status == _OS.FILLED:
-                    # Re-check: if fill_price is None but status is FILLED, use approved price
-                    fill_price = confirmed.fill_price or risk_result.approved_price
-                    fill_qty = confirmed.fill_quantity or risk_result.approved_quantity
-                    self.portfolio.record_fill(
-                        asset=symbol, side=PositionSide.LONG,
-                        quantity=fill_qty, price=fill_price, fee=confirmed.fee,
-                    )
-                    entry = fill_price
-                    pnl = (current_price - entry) * fill_qty
-                    position = {
-                        "id": str(uuid4()), "symbol": symbol, "side": "LONG",
-                        "quantity": str(fill_qty), "entry_price": str(entry),
-                        "current_price": str(current_price), "entry_fee": str(confirmed.fee),
-                        "pnl": str(pnl),
-                        "pnl_pct": str((pnl / (entry * fill_qty) * 100) if entry > 0 else 0),
-                        "stop_loss": str(decision.stop_loss) if decision.stop_loss else None,
-                        "take_profit": str(decision.take_profit) if decision.take_profit else None,
-                        "thesis": decision.thesis, "status": "OPEN",
-                        "opened_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    self._state["positions"].append(position)
-                    self._save_state()
-                    self.risk_engine.record_trade(symbol)
-                    self._state["orders"].append({
-                        "id": str(confirmed.order_id), "symbol": symbol,
-                        "side": "BUY", "quantity": str(fill_qty),
-                        "price": str(fill_price), "status": "FILLED",
-                        "fee": str(confirmed.fee), "error": None,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                    self.risk_engine.record_position_open()
-                    self._state["capital"] = str(self.portfolio.cash)
-                    self._state["pnl"] = str(self.portfolio.total_realized_pnl)
-                    logger.info("Order confirmed filled after poll: %s %s @ R$ %s", fill_qty, symbol, fill_price)
-
-                elif confirmed.status == _OS.PARTIALLY_FILLED:
-                    # Partial fill — record what was filled, leave remainder as UNKNOWN
-                    fill_price = confirmed.fill_price or risk_result.approved_price
-                    fill_qty = confirmed.fill_quantity or Decimal("0")
-                    if fill_qty > 0:
-                        self.portfolio.record_fill(
-                            asset=symbol, side=PositionSide.LONG,
-                            quantity=fill_qty, price=fill_price, fee=confirmed.fee,
+            elif order_result.status in (_OS.SUBMITTED, _OS.ACKNOWLEDGED, _OS.PARTIALLY_FILLED):
+                # P0-01: if the submit already carried a partial fill, apply it
+                if order_result.status == _OS.PARTIALLY_FILLED:
+                    initial_filled = order_result.fill_quantity or Decimal("0")
+                    if initial_filled > 0:
+                        self._apply_fill_delta(
+                            order_record, symbol, initial_filled,
+                            order_result.fill_price or risk_result.approved_price,
+                            order_result.fee, decision, current_price,
                         )
-                    self._state["orders"].append({
-                        "id": str(confirmed.order_id), "symbol": symbol,
-                        "side": "BUY", "quantity": str(risk_result.approved_quantity),
-                        "filled_quantity": str(fill_qty),
-                        "price": str(risk_result.approved_price),
-                        "status": "PARTIALLY_FILLED",
-                        "fee": str(confirmed.fee), "error": None,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                    self._save_state()
-                    logger.warning(
-                        "Order partially filled: %s %s — filled %s of %s",
-                        symbol, confirmed.order_id, fill_qty, risk_result.approved_quantity,
-                    )
+                # P0-02/P0-04: poll and continue from the executed state
+                await self._reconcile_pending_order(order_record, symbol, decision, current_price)
 
-                else:
-                    # REJECTED, ERROR, or UNKNOWN after polling
-                    self._state["orders"].append({
-                        "id": str(confirmed.order_id), "symbol": symbol,
-                        "side": "BUY", "quantity": str(risk_result.approved_quantity),
-                        "price": str(risk_result.approved_price),
-                        "status": confirmed.status.value,
-                        "error": confirmed.error,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                    self._save_state()
-                    logger.warning(
-                        "Order not filled after poll: %s — status=%s error=%s",
-                        symbol, confirmed.status.value, confirmed.error,
-                    )
+            elif order_result.status in (_OS.UNKNOWN, _OS.ERROR):
+                # P0-05: submit returned UNKNOWN or ERROR without confirmation —
+                # we do not know whether the order was placed. Fail-safe UNKNOWN.
+                logger.critical(
+                    "Order %s submit returned %s for %s — trading BLOCKED.",
+                    order_id, order_result.status.value, symbol,
+                )
+                order_record["status"] = "UNKNOWN"
+                order_record["error"] = order_result.error or f"Submit result {order_result.status.value}"
+                self._reconciled = False
+                self._save_state()
 
             else:
                 # REJECTED, ERROR, or other terminal state — no position created
-                self._state["orders"].append({
-                    "id": str(order_result.order_id), "symbol": symbol,
-                    "side": "BUY", "quantity": str(risk_result.approved_quantity),
-                    "price": str(risk_result.approved_price),
-                    "status": order_result.status.value,
-                    "error": order_result.error,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                order_record["status"] = order_result.status.value
+                order_record["error"] = order_result.error
                 self._save_state()
                 logger.warning(
                     "Order not filled: %s — status=%s error=%s",

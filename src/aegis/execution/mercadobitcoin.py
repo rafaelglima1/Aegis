@@ -342,6 +342,32 @@ class MercadoBitcoinBroker(BrokerAdapter):
         if not await self._authenticate():
             return OrderResult(order_id=order_id, status=OrderStatus.ERROR, error="Auth failed")
 
+        result = await self._query_order_by_mb_id(order_id, mb_order_id)
+        if result is None:
+            return OrderResult(
+                order_id=order_id,
+                status=OrderStatus.UNKNOWN,
+                error="Order not found on exchange",
+            )
+        return result
+
+    async def get_order_by_exchange_id(self, exchange_order_id: str) -> OrderResult | None:
+        """P0-09: Look up an order by its exchange-side identifier.
+
+        Used to recover UNKNOWN / SUBMITTED / PARTIALLY_FILLED orders that are
+        absent from open orders. Queries the MB API /api/v4/orders/{id}.
+        Returns None when the order cannot be found (e.g. already expired and
+        purged from the exchange's history).
+        """
+        if not await self._authenticate():
+            return None
+        try:
+            return await self._query_order_by_mb_id(None, exchange_order_id)
+        except Exception:
+            return None
+
+    async def _query_order_by_mb_id(self, order_id: UUID | None, mb_order_id: str) -> OrderResult | None:
+        """Internal helper: query MB API for order status by mb_order_id."""
         try:
             response = await self._client.get(
                 f"/api/v4/orders/{mb_order_id}",
@@ -357,19 +383,32 @@ class MercadoBitcoinBroker(BrokerAdapter):
                     "expired": OrderStatus.EXPIRED,
                 }
                 mb_status = result.get("status", "").lower()
-                status = status_map.get(mb_status, OrderStatus.ERROR)
+                status = status_map.get(mb_status, OrderStatus.UNKNOWN)
 
                 return OrderResult(
-                    order_id=order_id,
+                    order_id=order_id or UUID(int=0),
                     status=status,
-                    fill_price=Decimal(str(result.get("executed_price", "0"))) if result.get("executed_price") else None,
-                    fill_quantity=Decimal(str(result.get("executed_quantity", "0"))) if result.get("executed_quantity") else None,
+                    fill_price=(
+                        Decimal(str(result.get("executed_price", "0")))
+                        if result.get("executed_price") else None
+                    ),
+                    fill_quantity=(
+                        Decimal(str(result.get("executed_quantity", "0")))
+                        if result.get("executed_quantity") else None
+                    ),
                     fee=Decimal(str(result.get("fee", "0"))),
                 )
+            elif response.status_code == 404:
+                # Order not found on exchange (may be purged) → return None
+                return None
         except Exception as e:
-            return OrderResult(order_id=order_id, status=OrderStatus.ERROR, error=str(e))
+            return OrderResult(order_id=order_id or UUID(int=0), status=OrderStatus.ERROR, error=str(e))
 
-        return OrderResult(order_id=order_id, status=order.get("status", OrderStatus.REJECTED))
+        return OrderResult(
+            order_id=order_id or UUID(int=0),
+            status=OrderStatus.UNKNOWN,
+            error=f"MB API {response.status_code}",
+        )
 
     async def get_position(self, symbol: str) -> dict[str, Any]:
         """Get current position for a symbol."""
@@ -443,6 +482,8 @@ class MercadoBitcoinBroker(BrokerAdapter):
         Both must succeed for VALID status.
         If either fails, returns UNKNOWN or ERROR.
         """
+        from datetime import datetime, timezone
+
         from aegis.reconciliation import ExchangeSnapshot, ExchangeBalance, ExchangeOrder
 
         if not self._connected:
@@ -451,9 +492,13 @@ class MercadoBitcoinBroker(BrokerAdapter):
                     return ExchangeSnapshot(
                         status="ERROR",
                         error="Authentication failed",
+                        timestamp=datetime.now(timezone.utc).isoformat(),
                     )
             except Exception as e:
-                return ExchangeSnapshot(status="ERROR", error=str(e))
+                return ExchangeSnapshot(
+                    status="ERROR", error=str(e),
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
 
         try:
             # Get balances
@@ -465,6 +510,7 @@ class MercadoBitcoinBroker(BrokerAdapter):
                 return ExchangeSnapshot(
                     status="ERROR",
                     error=f"Balance query failed: HTTP {balances_response.status_code}",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
                 )
 
             balances = []
@@ -512,14 +558,19 @@ class MercadoBitcoinBroker(BrokerAdapter):
                     status="UNKNOWN",
                     error="Balances OK but open orders query failed",
                     balances=balances,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
                 )
 
             return ExchangeSnapshot(
                 status="VALID",
                 balances=balances,
                 open_orders=open_orders,
+                timestamp=datetime.now(timezone.utc).isoformat(),
             )
 
         except Exception as e:
             self._audit("snapshot_error", {"error": str(e)})
-            return ExchangeSnapshot(status="ERROR", error=str(e))
+            return ExchangeSnapshot(
+                status="ERROR", error=str(e),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )

@@ -114,15 +114,32 @@ class LocalOrder:
     side: str
     quantity: Decimal
     status: str
+    filled_quantity: Decimal = Decimal("0")
+    remaining_quantity: Decimal = Decimal("0")
+    exchange_order_id: str = ""
 
 
 @dataclass
 class LocalSnapshot:
-    """Snapshot of local worker state for reconciliation."""
+    """Snapshot of local worker state for reconciliation.
+
+    P0-07: Financial concepts are separated so reconciliation never compares
+    total equity against exchange BRL available.
+      - capital          → local cash available (BRL)
+      - cash_locked      → BRL reserved/locked by open orders
+      - positions        → open asset positions
+      - realized_pnl     → realized P&L (informational)
+      - unrealized_pnl   → unrealized P&L (informational)
+      - equity           → total equity (informational, not compared 1:1)
+    """
     capital: Decimal = Decimal("0")
     positions: list[LocalPosition] = field(default_factory=list)
     orders: list[LocalOrder] = field(default_factory=list)
     state_valid: bool = True
+    cash_locked: Decimal = Decimal("0")
+    realized_pnl: Decimal = Decimal("0")
+    unrealized_pnl: Decimal = Decimal("0")
+    equity: Decimal = Decimal("0")
 
 
 # ============================================================
@@ -182,8 +199,20 @@ class ReconciliationResult:
 class ReconciliationEngine:
     """Deterministic reconciliation between local and exchange state.
 
-    No automatic correction. Divergence blocks trading.
+    No automatic correction. Divergence or UNKNOWN blocks trading.
     """
+
+    def __init__(self) -> None:
+        self._unknown_reason: str | None = None
+
+    def _set_unknown(self, reason: str) -> None:
+        """Mark that the local model lacks information for a safe verdict.
+
+        P0-07/P0-13: NUNCA assumir zero. When we cannot determine a divergence
+        with safety, the result is UNKNOWN and trading is blocked.
+        """
+        if self._unknown_reason is None:
+            self._unknown_reason = reason
 
     def reconcile(
         self,
@@ -194,6 +223,7 @@ class ReconciliationEngine:
 
         Returns RECONCILED, DIVERGED, UNKNOWN, or ERROR.
         """
+        self._unknown_reason = None
         result = ReconciliationResult(
             exchange_snapshot=exchange,
             local_snapshot=local,
@@ -219,6 +249,12 @@ class ReconciliationEngine:
 
         result.divergences = divergences
 
+        # P0-13: UNKNOWN takes precedence — cannot determine with safety
+        if self._unknown_reason is not None:
+            result.status = ReconciliationStatus.UNKNOWN
+            result.error = self._unknown_reason
+            return result
+
         if not divergences:
             result.status = ReconciliationStatus.RECONCILED
         elif any(d.severity == DivergenceSeverity.CRITICAL for d in divergences):
@@ -234,38 +270,60 @@ class ReconciliationEngine:
         local: LocalSnapshot,
         exchange: ExchangeSnapshot,
     ) -> list[Divergence]:
-        """Compare local capital/positions against exchange balances."""
+        """Compare local cash/positions against exchange balances.
+
+        P0-07: Never compare total equity against exchange BRL available.
+        Local cash maps to exchange BRL; positions map to exchange assets.
+        Locked balances are accounted for; when the local model cannot explain
+        locked funds, the result is UNKNOWN (never assumed to be zero).
+        """
         divergences: list[Divergence] = []
 
-        # Derive BRL balance from local portfolio
-        # For spot: BRL balance = capital - total position value
-        # We compare available BRL on exchange vs local capital
         brl_balance = exchange.get_balance("BRL")
-        if brl_balance is not None:
-            # Exchange BRL available should roughly match local capital
-            # (exact match depends on fees, timing)
-            if brl_balance.available != local.capital:
-                divergences.append(Divergence(
-                    field="capital",
-                    local_value=str(local.capital),
-                    exchange_value=str(brl_balance.available),
-                    severity=DivergenceSeverity.CRITICAL,
-                    message=(
-                        f"Local capital R$ {local.capital} != "
-                        f"Exchange BRL available R$ {brl_balance.available}"
-                    ),
-                ))
-        else:
-            # BRL balance unknown on exchange
+        if brl_balance is None:
             divergences.append(Divergence(
-                field="capital",
+                field="cash_brl",
                 local_value=str(local.capital),
                 exchange_value="UNKNOWN",
                 severity=DivergenceSeverity.CRITICAL,
                 message="BRL balance not available from exchange",
             ))
+            return divergences
 
-        # Check crypto positions
+        # P0-07 item 2: BRL locked must be explainable locally
+        pending_buy_reservation = self._pending_buy_reservation(local)
+
+        if brl_balance.locked > 0:
+            if local.cash_locked <= 0 and pending_buy_reservation <= 0:
+                # Exchange holds BRL we cannot account for → can't determine safely
+                self._set_unknown(
+                    "Exchange reports BRL locked but local model has no cash_locked "
+                    "or pending BUY reservation to explain it"
+                )
+
+        # Local cash vs exchange BRL (available + locked attributable to us)
+        local_total_brl = local.capital + local.cash_locked
+        exchange_total_brl = brl_balance.available + brl_balance.locked
+
+        # Local pending BUY orders reserve cash that is not yet deducted from
+        # local.capital but is held as locked BRL on the exchange. The local
+        # total already includes that reservation, so it must match the
+        # exchange total (available + locked).
+        expected_exchange_total = local_total_brl
+
+        if exchange_total_brl != expected_exchange_total:
+            divergences.append(Divergence(
+                field="cash_brl",
+                local_value=f"{local.capital} available + {local.cash_locked} locked",
+                exchange_value=f"{brl_balance.available} available + {brl_balance.locked} locked",
+                severity=DivergenceSeverity.CRITICAL,
+                message=(
+                    f"Local BRL total R$ {local_total_brl} != "
+                    f"Exchange BRL total R$ {exchange_total_brl}"
+                ),
+            ))
+
+        # Check crypto positions against exchange balances (available + locked)
         local_crypto = {
             p.symbol.split("-")[0]: p
             for p in local.positions
@@ -282,19 +340,37 @@ class ReconciliationEngine:
                     severity=DivergenceSeverity.CRITICAL,
                     message=f"Local has {asset} position but exchange balance unknown",
                 ))
-            elif exchange_balance.available < local_pos.quantity:
-                divergences.append(Divergence(
-                    field=f"position_{asset}",
-                    local_value=str(local_pos.quantity),
-                    exchange_value=str(exchange_balance.available),
-                    severity=DivergenceSeverity.CRITICAL,
-                    message=(
-                        f"Local {asset} quantity {local_pos.quantity} > "
-                        f"exchange available {exchange_balance.available}"
-                    ),
-                ))
+            else:
+                exchange_total_asset = exchange_balance.available + exchange_balance.locked
+                if local_pos.quantity > exchange_total_asset:
+                    divergences.append(Divergence(
+                        field=f"position_{asset}",
+                        local_value=str(local_pos.quantity),
+                        exchange_value=str(exchange_total_asset),
+                        severity=DivergenceSeverity.CRITICAL,
+                        message=(
+                            f"Local {asset} quantity {local_pos.quantity} > "
+                            f"exchange total (available+locked) {exchange_total_asset}"
+                        ),
+                    ))
 
         return divergences
+
+    @staticmethod
+    def _pending_buy_reservation(local: LocalSnapshot) -> Decimal:
+        """Sum of quantities of local pending BUY orders.
+
+        Used to determine whether exchange-locked BRL can be explained by
+        local open orders. A non-zero return indicates plausible explanation
+        exists (the locked BRL may be reserved for these orders).
+        """
+        total = Decimal("0")
+        for o in local.orders:
+            if o.status in ("SUBMITTED", "PARTIALLY_FILLED", "UNKNOWN", "ACKNOWLEDGED", "PENDING"):
+                if o.side == "BUY":
+                    remaining = o.remaining_quantity if o.remaining_quantity > 0 else o.quantity
+                    total += remaining
+        return total
 
     def _reconcile_orders(
         self,
@@ -304,29 +380,31 @@ class ReconciliationEngine:
         """Compare local orders against exchange open orders.
 
         Active/open orders on exchange not known locally → CRITICAL.
-        Local SUBMITTED/PENDING orders not found on exchange → WARNING
-        (could be filled/cancelled between submission and reconciliation).
+        Local pending orders not found on exchange → UNKNOWN (P0-09): a pending
+        order missing from open orders is NOT assumed non-existent — it may be
+        filled/partially filled/rejected. Only the exchange can resolve it.
         """
         divergences: list[Divergence] = []
 
         local_pending = {
             o.local_order_id: o
             for o in local.orders
-            if o.status in ("SUBMITTED", "PENDING")
+            if o.status in ("SUBMITTED", "PARTIALLY_FILLED", "UNKNOWN", "ACKNOWLEDGED", "PENDING")
         }
 
         exchange_ids = {o.exchange_order_id for o in exchange.open_orders}
 
-        # Local orders not found on exchange — may have been filled/cancelled
+        # Local pending orders not on exchange — NOT assumed resolved (P0-09)
         for order_id, local_order in local_pending.items():
             if order_id not in exchange_ids:
-                divergences.append(Divergence(
-                    field=f"order_{order_id}",
-                    local_value=f"{local_order.side} {local_order.quantity} {local_order.symbol}",
-                    exchange_value="NOT_FOUND",
-                    severity=DivergenceSeverity.WARNING,
-                    message=f"Local order {order_id} not found on exchange",
-                ))
+                # A SUBMITTED/UNKNOWN/PARTIALLY_FILLED order is not in open
+                # orders. Without order-history evidence we cannot determine
+                # whether it filled, was rejected, or vanished → UNKNOWN.
+                self._set_unknown(
+                    f"Local order {order_id} ({local_order.side} "
+                    f"{local_order.quantity} {local_order.symbol}) not found in "
+                    "exchange open orders and no order-history evidence"
+                )
 
         # Exchange orders not known locally — CRITICAL (active order we don't know about)
         for ex_order in exchange.open_orders:

@@ -322,13 +322,47 @@ class TestRiskExposure:
 class TestDeadCodeCleanup:
 
     def test_no_duplicate_reload_config(self) -> None:
-        """P0-10: _reload_config is defined only once."""
+        """P0-10: _reload_config is defined only once and registers the prompt."""
         import inspect
         import aegis.worker as worker_mod
         source = inspect.getsource(worker_mod.AutonomousWorker._reload_config)
-        # Should not contain the prompt template that was dead code
-        assert "DADOS DE MERCADO" not in source
+        # Defined only once — must still register the PromptVersion
+        assert source.count("def _reload_config") == 1
+        assert "prompt_manager.register" in source
+        assert "PromptVersion" in source
         assert "_max_pos" not in source
+
+    def test_reload_config_registers_prompt_version(self, tmp_path) -> None:
+        """P0-11: _reload_config() updates the prompt manager with a PromptVersion."""
+        import aegis.worker as worker_mod
+        from aegis.worker import AutonomousWorker
+        from aegis.ai_engine.prompt_manager import PromptVersion
+
+        original_state = worker_mod._STATE_FILE
+        original_settings = worker_mod._SETTINGS_FILE
+        original_prompt = worker_mod._PROMPT_FILE
+        try:
+            worker_mod._STATE_FILE = tmp_path / "state.json"
+            worker_mod._SETTINGS_FILE = tmp_path / "test.env"
+            worker_mod._PROMPT_FILE = tmp_path / "nonexistent_prompt.txt"
+            # Create a minimal env file so _reload_config actually rebuilds the prompt
+            (tmp_path / "test.env").write_text("LONG_ONLY=true\n")
+            w = AutonomousWorker()
+            # Default prompt registered in __init__
+            assert "trading_v1" in w.prompt_manager.list_versions()
+            before = w.prompt_manager.get("trading_v1").template
+            w._reload_config()
+            assert "trading_v1" in w.prompt_manager.list_versions()
+            after = w.prompt_manager.get("trading_v1").template
+            # Fallback template rebuilt from config must be registered
+            assert "DADOS DE MERCADO" in after
+            assert isinstance(w.prompt_manager.get("trading_v1"), PromptVersion)
+            # Template should have changed after reload
+            assert before != after
+        finally:
+            worker_mod._STATE_FILE = original_state
+            worker_mod._SETTINGS_FILE = original_settings
+            worker_mod._PROMPT_FILE = original_prompt
 
 
 # ============================================================
