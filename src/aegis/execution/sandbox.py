@@ -58,7 +58,17 @@ class SandboxBroker(BrokerAdapter):
         self._pending_fills[order_id] = [Decimal(q) for q in sequence]
 
     def _advance_partial_fill(self, order: SandboxOrder) -> None:
-        """Advance an order's cumulative fill by one step."""
+        """Advance an order's cumulative fill by one step.
+
+        P0 (partial SELL accounting): each executed delta moves cash in the
+        correct direction and applies the fee for that delta:
+          BUY  → cash -= delta_value + fee   (pay for asset)
+          SELL → cash += delta_value - fee   (receive proceeds for asset)
+
+        Only the new delta is accounted — previously filled quantity is never
+        re-accounted (idempotent). A repeated (non-increasing) fill yields
+        delta == 0 and no financial change.
+        """
         remaining = self._pending_fills.get(order.order_id)
         if not remaining:
             return
@@ -66,8 +76,14 @@ class SandboxBroker(BrokerAdapter):
         self._pending_fills[order.order_id] = remaining[1:]
         prev_fill = order.fill_quantity or Decimal("0")
         delta = next_fill - prev_fill
-        if order.fill_price is not None:
-            self._balance -= order.fill_price * delta
+        if delta < 0:
+            delta = Decimal("0")
+        if order.fill_price is not None and delta > 0:
+            delta_value = order.fill_price * delta
+            if order.side == OrderSide.SELL:
+                self._balance += delta_value - order.fee
+            else:
+                self._balance -= delta_value + order.fee
         order.fill_quantity = next_fill
         if next_fill >= order.quantity:
             order.status = OrderStatus.FILLED
@@ -135,6 +151,36 @@ class SandboxBroker(BrokerAdapter):
             # C6-04: SELL slippage is unfavorable to seller (fill_price < price)
             slippage = submission.price * self._slippage_bps
             fill_price = submission.price - slippage
+
+            # P0: SELL partial-fill support (mirrors the BUY partial path)
+            if submission.order_id in self._pending_fills:
+                sequence = self._pending_fills[submission.order_id]
+                first_fill = sequence[0] if sequence else Decimal("0")
+                first_value = fill_price * first_fill
+                self._balance += first_value - fee
+                order = SandboxOrder(
+                    order_id=submission.order_id,
+                    idempotency_key=submission.idempotency_key,
+                    symbol=submission.symbol,
+                    side=submission.side,
+                    quantity=submission.quantity,
+                    price=submission.price,
+                    status=OrderStatus.PARTIALLY_FILLED,
+                    fill_price=fill_price,
+                    fill_quantity=first_fill,
+                    fee=fee,
+                )
+                self._orders[submission.order_id] = order
+                # Advance the sequence so next poll sees the next cumulative value
+                self._pending_fills[submission.order_id] = sequence[1:]
+
+                return OrderResult(
+                    order_id=submission.order_id,
+                    status=OrderStatus.PARTIALLY_FILLED,
+                    fill_price=fill_price,
+                    fill_quantity=first_fill,
+                    fee=fee,
+                )
 
             order = SandboxOrder(
                 order_id=submission.order_id,
@@ -317,7 +363,7 @@ class SandboxBroker(BrokerAdapter):
         """Get sandbox state as ExchangeSnapshot for reconciliation."""
         from datetime import datetime, timezone
 
-        from aegis.reconciliation import ExchangeSnapshot, ExchangeBalance, ExchangeOrder
+        from aegis.reconciliation import ExchangeBalance, ExchangeOrder, ExchangeSnapshot
 
         balances = [
             ExchangeBalance(
