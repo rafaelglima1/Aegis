@@ -634,6 +634,8 @@ Responda com JSON:
                     risk_state["last_trade_time"] = None
             if hasattr(self.risk_engine, '_kill_switch_active'):
                 risk_state["kill_switch_active"] = self.risk_engine._kill_switch_active
+            if hasattr(self.risk_engine, '_kill_switch_episode'):
+                risk_state["kill_switch_episode"] = self.risk_engine._kill_switch_episode
             if hasattr(self.risk_engine, '_circuit_breaker_active'):
                 risk_state["circuit_breaker_active"] = self.risk_engine._circuit_breaker_active
 
@@ -793,6 +795,8 @@ Responda com JSON:
                     self.risk_engine._last_trade_time = {"_default": _dt.fromisoformat(ltt)}
             if "kill_switch_active" in risk_saved:
                 self.risk_engine._kill_switch_active = risk_saved["kill_switch_active"]
+            if "kill_switch_episode" in risk_saved:
+                self.risk_engine._kill_switch_episode = risk_saved["kill_switch_episode"]
             if "circuit_breaker_active" in risk_saved:
                 self.risk_engine._circuit_breaker_active = risk_saved["circuit_breaker_active"]
 
@@ -935,6 +939,82 @@ Responda com JSON:
                 "Periodic reconciliation: %s — trading BLOCKED until next successful reconciliation",
                 self._reconciliation_status,
             )
+
+    async def _run_flatten_if_needed(self) -> None:
+        """Preemptive kill-switch sweep (Vibe #8).
+
+        When the kill switch is active, cancel every resting order and close
+        every open position, exactly once per halt episode. Runs before any
+        new order so a tripped switch also protects open exposure, not just
+        the next order.
+        """
+        if not self.risk_engine.is_kill_switch_active():
+            return
+
+        episode = self.risk_engine.kill_switch_episode
+        if not episode:
+            logger.error("Kill switch active without episode — cannot run flatten sweep")
+            return
+
+        from aegis.execution.flatten import FlattenSweep
+        from uuid import UUID as _UUID
+
+        sweep = FlattenSweep(
+            cancel_order=lambda oid, idem: self.execution.cancel_order(oid, idem),
+            submit_close=lambda **kw: self.execution.execute_order(
+                order_id=uuid4(),
+                idempotency_key=uuid4(),
+                symbol=kw["symbol"],
+                side=__import__("aegis.domain.enums", fromlist=["OrderSide"]).OrderSide.SELL,
+                quantity=kw["quantity"],
+                price=kw.get("price") or Decimal("0"),
+                correlation_id=uuid4(),
+                risk_decision=self._close_risk_decision(kw["symbol"]),
+            ),
+            allow_flatten=True,
+        )
+
+        if sweep.has_run_for(episode):
+            logger.info("Flatten already run for episode %s — skipping", episode)
+            return
+
+        open_orders = []
+        try:
+            snap = await self.broker.get_exchange_snapshot()
+            if snap is not None and getattr(snap, "is_valid", False):
+                open_orders = [
+                    {"order_id": _UUID(o.exchange_order_id)}
+                    for o in snap.open_orders
+                ]
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not read open orders for flatten: %s", e)
+
+        positions = [
+            {
+                "symbol": p["symbol"],
+                "quantity": p["quantity"],
+            }
+            for p in self._state["positions"]
+            if p.get("status") == "OPEN"
+        ]
+
+        result = await sweep.run(episode, open_orders, positions)
+        logger.critical(
+            "Kill-switch flatten sweep (episode %s): %s",
+            episode, result.to_dict(),
+        )
+        self._save_state()
+
+    def _close_risk_decision(self, symbol: str):
+        """Build an approved RiskDecision for a flatten close (CLOSE always approved)."""
+        from aegis.risk_engine.risk_engine import RiskDecision
+        return RiskDecision(
+            status="APPROVED",
+            approved_quantity=Decimal("0"),
+            approved_price=Decimal("0"),
+            risk_amount=Decimal("0"),
+            exposure=Decimal("0"),
+        )
 
     async def _poll_order_status(
         self, order_id: Any, max_retries: int = 3, delay_seconds: float = 2.0,
@@ -1189,6 +1269,10 @@ Responda com JSON:
                 self._reconciliation_status,
             )
             return
+
+        # Flatten: if kill switch is active, cancel resting orders then close
+        # positions once per episode (Vibe #8 — cancel-before-flatten).
+        await self._run_flatten_if_needed()
 
         for symbol in self.symbols:
             try:
@@ -1556,6 +1640,31 @@ Responda com JSON:
 
             order_id = uuid4()
             idempotency_key = uuid4()
+
+            # P0-05: durable pending-action marker written BEFORE broker call
+            # (crash-safe ownership — Vibe #5).
+            from aegis.execution.pending_action import (
+                new_pending_order, save_pending_action, clear_pending_action,
+                transition_to_fill,
+            )
+            try:
+                save_pending_action(new_pending_order(
+                    order_id=order_id,
+                    idempotency_key=idempotency_key,
+                    symbol=symbol,
+                    side="BUY",
+                    quantity=risk_result.approved_quantity,
+                    price=risk_result.approved_price,
+                    pre_position_qty=Decimal(
+                        self._find_open_position(symbol)["quantity"]
+                        if self._find_open_position(symbol) else "0"
+                    ),
+                ))
+            except Exception as exc:
+                logger.critical("Pending action marker FAILED — blocking trade: %s", exc)
+                self._reconciled = False
+                return
+
             order_result = await self.execution.execute_order(
                 order_id=order_id,
                 idempotency_key=idempotency_key,
@@ -1649,6 +1758,13 @@ Responda com JSON:
                     "Order not filled: %s — status=%s error=%s",
                     symbol, order_result.status.value, order_result.error,
                 )
+
+            # P0-05: clear the pending-action marker once the order is resolved
+            # to a known/terminal state. An UNKNOWN order stays marked so a
+            # restart can reconcile it via the exchange (Vibe #5).
+            from aegis.execution.pending_action import clear_pending_action
+            if order_record.get("status") != "UNKNOWN":
+                clear_pending_action()
 
         elif decision.action == TradingAction.CLOSE:
             # C7-03: CLOSE routes through ExecutionEngine → Broker → Portfolio.

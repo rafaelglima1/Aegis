@@ -79,6 +79,7 @@ class RiskEngine:
     def __init__(self, limits: RiskLimits | None = None) -> None:
         self._limits = limits or RiskLimits()
         self._kill_switch_active = False
+        self._kill_switch_episode: str | None = None
         self._daily_pnl = Decimal("0")
         self._positions_count = 0
         self._peak_equity = self._limits.reference_capital
@@ -99,13 +100,36 @@ class RiskEngine:
     def limits(self, value: RiskLimits) -> None:
         self._limits = value
 
-    def activate_kill_switch(self) -> None:
-        """Kill switch blocks new orders."""
+    def activate_kill_switch(self, episode: str | None = None) -> str:
+        """Trip the kill switch bound to a specific halt episode.
+
+        P0: kill switch latch is bound to an episode (from Vibe-Trading). Once
+        tripped, the episode id is fixed and restart-safe — the flag cannot be
+        silently cleared and re-tripped as a fresh episode.
+
+        Returns the episode id.
+        """
+        if self._kill_switch_active and self._kill_switch_episode is not None:
+            return self._kill_switch_episode
+        if episode is None:
+            episode = str(uuid4())
         self._kill_switch_active = True
+        self._kill_switch_episode = episode
+        return episode
 
     def deactivate_kill_switch(self) -> None:
-        """Deactivate kill switch."""
+        """Deactivate kill switch, clearing its episode binding."""
         self._kill_switch_active = False
+        self._kill_switch_episode = None
+
+    @property
+    def kill_switch_episode(self) -> str | None:
+        """Episode id bound to the active kill switch, or None when inactive."""
+        return self._kill_switch_episode
+
+    def is_kill_switch_active(self) -> bool:
+        """Kill switch is tripped AND still bound to an episode."""
+        return self._kill_switch_active
 
     def record_daily_pnl(self, pnl: Decimal) -> None:
         """Record daily P&L for daily loss limit check."""
