@@ -84,6 +84,8 @@ class RiskEngine:
         self._positions_count = 0
         self._peak_equity = self._limits.reference_capital
         self._circuit_breaker_active = False
+        self._circuit_breaker_tripped_at: float | None = None
+        self._circuit_breaker_trough_equity: Decimal | None = None
         self._current_exposure = Decimal("0")
 
         # New: Trade tracking for cooldown and anti-flip-flop
@@ -158,13 +160,59 @@ class RiskEngine:
         self._current_exposure += amount
 
     def update_equity(self, current_equity: Decimal) -> None:
-        """Update equity and check circuit breaker."""
+        """Update equity and check circuit breaker with auto-cooldown.
+
+        When the circuit breaker has been active for longer than the cooldown
+        period AND equity has recovered from the trough by at least
+        ``circuit_breaker_reentry_equity_recovery_pct``, the circuit breaker
+        (and its attached kill switch) are automatically cleared.
+        """
+        import time as _time
+
         if current_equity > self._peak_equity:
             self._peak_equity = current_equity
 
-        drawdown = (self._peak_equity - current_equity) / self._peak_equity
-        if drawdown >= self._limits.circuit_breaker_drawdown_pct:
+        drawdown = (
+            (self._peak_equity - current_equity) / self._peak_equity
+            if self._peak_equity > 0 else Decimal("0")
+        )
+
+        just_cleared = False
+        if self._circuit_breaker_active:
+            # Track the trough equity for recovery check.
+            if (
+                self._circuit_breaker_trough_equity is None
+                or current_equity < self._circuit_breaker_trough_equity
+            ):
+                self._circuit_breaker_trough_equity = current_equity
+
+            # Auto-cooldown: if enough time has passed and equity recovered, clear.
+            if self._circuit_breaker_tripped_at is not None:
+                elapsed = _time.monotonic() - self._circuit_breaker_tripped_at
+                cooldown_secs = float(self._limits.circuit_breaker_cooldown_minutes * 60)
+                if elapsed >= cooldown_secs:
+                    # Check recovery from trough.
+                    trough = self._circuit_breaker_trough_equity or current_equity
+                    if trough > 0:
+                        recovery = (current_equity - trough) / trough
+                        if recovery >= self._limits.circuit_breaker_reentry_equity_recovery_pct:
+                            self._circuit_breaker_active = False
+                            self._circuit_breaker_tripped_at = None
+                            self._circuit_breaker_trough_equity = None
+                            self.deactivate_kill_switch()
+                            just_cleared = True
+                            logger.info(
+                                "Circuit breaker auto-cleared after cooldown "
+                                "(recovery=%.2f%%)", recovery * 100,
+                            )
+
+        if drawdown >= self._limits.circuit_breaker_drawdown_pct and not just_cleared:
+            # Re-trip only if we didn't JUST auto-clear on this print — the
+            # cooldown+recovery gate is the deliberate re-entry signal, so the
+            # same print must not immediately re-trip it.
             self._circuit_breaker_active = True
+            self._circuit_breaker_tripped_at = _time.monotonic()
+            self._circuit_breaker_trough_equity = current_equity
             self.activate_kill_switch()
 
     @property
@@ -435,7 +483,7 @@ class RiskEngine:
                 reasons=[v.message for v in violations],
             )
 
-        quantity = self._calculate_position_size(decision)
+        quantity = self._calculate_position_size(decision, setup_score)
         risk_amount = quantity * (decision.entry_price or Decimal("0"))
 
         return RiskDecision(
@@ -447,11 +495,18 @@ class RiskEngine:
             reasons=["Risk checks passed"],
         )
 
-    def _calculate_position_size(self, decision: DecisionContract) -> Decimal:
+    def _calculate_position_size(
+        self, decision: DecisionContract, setup_score: int | None = None,
+    ) -> Decimal:
         """Position sizing based on risk.
 
         size = min(risk_based_size, max_position_size)
         risk_based_size = max_risk / stop_distance
+
+        Confidence × setup-score scaling (profit maximization): the base risk
+        size is multiplied by a quality factor in [0.5, 1.0] derived from the
+        signal strength. Weak signals (low confidence or low setup score) trade
+        smaller; strong signals trade up to full size.
         """
         if not decision.entry_price or decision.entry_price <= 0:
             return Decimal("0")
@@ -462,7 +517,38 @@ class RiskEngine:
         if stop_distance <= 0:
             return Decimal("0")
 
-        quantity = max_risk / stop_distance
+        base_quantity = max_risk / stop_distance
+
+        # Quality scaling: factor in [0.5, 1.0].
+        confidence_factor = Decimal("1.0")
+        if self._limits.min_confidence > 0:
+            confidence_factor = (decision.confidence / self._limits.min_confidence).quantize(
+                Decimal("0.01")
+            )
+        confidence_factor = min(Decimal("1.0"), max(Decimal("0.5"), confidence_factor))
+
+        setup_factor = Decimal("1.0")
+        if self._limits.setup_score_strong > 0 and setup_score is not None:
+            if setup_score >= self._limits.setup_score_very_strong:
+                setup_factor = Decimal("1.0")
+            elif setup_score >= self._limits.setup_score_strong:
+                setup_factor = Decimal("0.8")
+            else:
+                setup_factor = Decimal("0.6")
+
+        quantity = base_quantity * confidence_factor * setup_factor
+
+        # Daily-loss progressive size reduction (loss mitigation):
+        #   at warn threshold  → 50% size
+        #   at strong threshold → 25% size
+        #   at block threshold → entries already rejected by evaluate()
+        if self._limits.reference_capital > 0:
+            daily_pnl_pct = self._daily_pnl / self._limits.reference_capital
+            if daily_pnl_pct <= -self._limits.daily_loss_strong_pct:
+                quantity = quantity * Decimal("0.25")
+            elif daily_pnl_pct <= -self._limits.daily_loss_warn_pct:
+                quantity = quantity * Decimal("0.50")
+
         max_quantity = self._limits.max_position_size / decision.entry_price
 
         return min(quantity, max_quantity)

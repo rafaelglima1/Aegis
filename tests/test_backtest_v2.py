@@ -460,3 +460,40 @@ class TestBacktestMetrics:
         result = engine._calculate_metrics(result)
         assert result.max_consecutive_wins == 2
         assert result.max_consecutive_losses == 1
+
+
+class TestBacktestProfitMetrics:
+
+    def test_mfe_mae_calculated_from_trade(self) -> None:
+        """MFE/MAE should be computed from the position's high/low."""
+        engine = BacktestEngineV2()
+        result = BacktestResult()
+        risk = Decimal("100")
+        entry = Decimal("500")
+        highest = Decimal("700")
+        lowest = Decimal("400")
+        exit_p = Decimal("550")
+        mfe_r = (highest - entry) / risk  # 2.0
+        mae_r = (entry - lowest) / risk   # 1.0
+        result.trades = [
+            TradeRecord(
+                realized_pnl=Decimal("50"), realized_r=Decimal("0.5"),
+                mfe=mfe_r, mae=mae_r,
+            ),
+        ]
+        result = engine._calculate_metrics(result)
+        assert result.avg_mfe_r == Decimal("2.0")
+        assert result.avg_mae_r == Decimal("1.0")
+
+    def test_profit_factor_infinite_when_no_losses(self) -> None:
+        """Profit factor should be 9999 when gross_loss is 0."""
+        engine = BacktestEngineV2()
+        result = BacktestResult()
+        result.trades = [
+            TradeRecord(realized_pnl=Decimal("10")),
+            TradeRecord(realized_pnl=Decimal("5")),
+        ]
+        result = engine._calculate_metrics(result)
+        assert result.profit_factor == Decimal("9999"), "no-loss PF should be sentinel"
+        assert result.gross_loss == 0
+        assert result.gross_profit == Decimal("15")

@@ -61,13 +61,21 @@ class DashboardMetrics:
 @dataclass
 class DashboardRiskStatus:
     """Risk status display.
-    AC-C3-05: max_positions has no default — must come from config."""
+    AC-C3-05: max_positions has no default — must come from config.
+
+    Vibe patterns exposed: halt_reason, kill_switch_episode, deltas,
+    pending_action.
+    """
 
     kill_switch_active: bool = False
+    kill_switch_episode: str | None = None
     daily_pnl: Decimal = Decimal("0")
     daily_loss_limit: Decimal = Decimal("500.00")
     max_positions: int = 0
     current_positions: int = 0
+    reconciled: bool = True
+    reconciliation_status: str = "SKIPPED"
+    halt_reason: str | None = None
 
 
 @dataclass

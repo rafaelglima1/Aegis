@@ -29,6 +29,10 @@ class RiskLimits:
     circuit_breaker_drawdown_pct: Decimal = Decimal("0.10")  # 10%
     max_daily_loss_pct: Decimal = Decimal("0.05")  # 5%
 
+    # Circuit breaker cooldown (Vibe: auto re-arm after time, not manual-only)
+    circuit_breaker_cooldown_minutes: int = 30  # Auto clear CB after N minutes
+    circuit_breaker_reentry_equity_recovery_pct: Decimal = Decimal("0.05")  # Re-enter only if recovered this much from trough
+
     # New: Quality filters
     min_confidence: Decimal = Decimal("0.50")  # Minimum confidence for LONG
     min_risk_reward: Decimal = Decimal("1.50")  # Minimum R/R ratio

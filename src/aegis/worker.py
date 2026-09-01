@@ -410,6 +410,8 @@ class AutonomousWorker:
             max_daily_loss_pct=self.max_daily_loss_pct,
             max_position_size_pct=self.max_position_size_pct,
             max_exposure_pct=self.max_exposure_pct,
+            circuit_breaker_cooldown_minutes=30,
+            circuit_breaker_reentry_equity_recovery_pct=Decimal("0.05"),
         ))
         self.broker = self._create_broker()
         self.execution = ExecutionEngine(self.broker)
@@ -456,6 +458,7 @@ Responda com JSON:
         self._reconciliation_status = "SKIPPED"  # Until reconciliation runs
         self._reconciliation_interval = self._settings.reconciliation_interval_seconds
         self._last_reconciliation_time: float = 0.0  # time.monotonic() timestamp
+        self._last_reconciliation = None  # last ReconciliationResult (for dashboard)
         self._state: dict[str, Any] = {
             "capital": str(self.capital),
             "pnl": "0.00",
@@ -488,6 +491,29 @@ Responda com JSON:
         s["state_valid"] = self._state_valid
         s["reconciled"] = self._reconciled
         s["reconciliation_status"] = self._reconciliation_status
+
+        # Vibe patterns exposed for the dashboard.
+        s["halt_reason"] = None
+        s["reconciliation_deltas"] = []
+        if self._last_reconciliation is not None:
+            s["halt_reason"] = self._last_reconciliation.halt_reason
+            s["reconciliation_deltas"] = [
+                {
+                    "kind": d.kind.value,
+                    "entity": d.entity,
+                    "message": d.message,
+                    "blocks_trading": d.blocks_trading,
+                }
+                for d in self._last_reconciliation.deltas
+            ]
+        s["kill_switch_active"] = self.risk_engine.is_kill_switch_active()
+        s["kill_switch_episode"] = self.risk_engine.kill_switch_episode
+
+        # Pending-action marker (crash-safe ownership) present?
+        from aegis.execution.pending_action import load_pending_action
+        pending = load_pending_action()
+        s["pending_action"] = pending is not None
+        s["pending_action_phase"] = pending.phase if pending else None
         return s
 
     async def close_position_manual(self, position_id: str) -> dict[str, Any]:
@@ -879,6 +905,7 @@ Responda com JSON:
             logger.critical("Exchange snapshot failed: %s — reconciliation ERROR", e)
             self._reconciliation_status = "ERROR"
             self._reconciled = False
+            self._last_reconciliation = None
             return
 
         if exchange_snapshot is None:
@@ -889,6 +916,7 @@ Responda com JSON:
             )
             self._reconciliation_status = "SKIPPED"
             self._reconciled = True
+            self._last_reconciliation = None
             return
 
         # Run reconciliation
@@ -897,6 +925,7 @@ Responda com JSON:
 
         self._reconciliation_status = result.status.value
         self._reconciled = result.is_reconciled
+        self._last_reconciliation = result
 
         if result.is_reconciled:
             logger.info("Exchange reconciliation: RECONCILED")
@@ -1098,6 +1127,8 @@ Responda com JSON:
             max_daily_loss_pct=self.max_daily_loss_pct,
             max_position_size_pct=self.max_position_size_pct,
             max_exposure_pct=self.max_exposure_pct,
+            circuit_breaker_cooldown_minutes=30,
+            circuit_breaker_reentry_equity_recovery_pct=Decimal("0.05"),
         )
 
         self._state["capital"] = str(self.portfolio.cash)
@@ -1254,11 +1285,19 @@ Responda com JSON:
         # Reload config from .env.prod (settings may have changed via dashboard)
         self._reload_config()
 
-        # Periodic reconciliation (time-based, not tick-based)
+        # Periodic reconciliation (time-based, not tick-based).
+        # Loss mitigation: reconcile more frequently when a position is open
+        # so a divergence is caught early (60s) vs idle (configured interval).
         now = time.monotonic()
         elapsed = now - self._last_reconciliation_time
-        if (self._reconciliation_interval > 0 and
-                elapsed >= self._reconciliation_interval):
+        has_open_position = any(
+            p.get("status") == "OPEN" for p in self._state.get("positions", [])
+        )
+        reconcile_interval = (
+            min(self._reconciliation_interval, 60) if has_open_position
+            else self._reconciliation_interval
+        )
+        if (reconcile_interval > 0 and elapsed >= reconcile_interval):
             self._last_reconciliation_time = now
             await self._periodic_reconcile()
 
@@ -1622,6 +1661,19 @@ Responda com JSON:
                 [v.code for v in risk_result.violations],
             )
             return
+
+        # Regime filter: avoid LONG in adverse regimes (loss mitigation).
+        # The risk engine already rejects BEARISH trend; this is an additional
+        # gate on the SetupScorer's market_regime classification.
+        if decision.action == TradingAction.LONG:
+            adverse_regimes = {"BEAR", "STRONG_BEAR", "HIGH_VOLATILITY"}
+            regime = setup_result.market_regime
+            if regime in adverse_regimes:
+                logger.info(
+                    "Regime filter: %s — skipping LONG in %s regime",
+                    symbol, regime,
+                )
+                return
 
         # 7. Execute trade
         if decision.action == TradingAction.LONG:

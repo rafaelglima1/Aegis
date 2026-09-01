@@ -161,3 +161,79 @@ def test_unapproved_order_cannot_reach_execution() -> None:
     decision = make_long_decision()
     result = engine.evaluate(decision)
     assert not result.is_approved
+
+
+class TestCircuitBreakerCooldown:
+
+    def test_circuit_breaker_auto_clears_after_cooldown(self) -> None:
+        """Circuit breaker auto-clears after cooldown with recovery."""
+        import time as _time
+        limits = RiskLimits(
+            reference_capital=Decimal("100"),
+            circuit_breaker_drawdown_pct=Decimal("0.10"),
+            circuit_breaker_cooldown_minutes=0,  # immediate
+            circuit_breaker_reentry_equity_recovery_pct=Decimal("0.01"),
+        )
+        engine = RiskEngine(limits=limits)
+        engine.update_equity(Decimal("80"))  # drawdown 20% → trip CB
+        assert engine._circuit_breaker_active
+        assert engine.is_kill_switch_active()
+
+        engine.update_equity(Decimal("82"))  # recovered 2.5% from 80 → >1%
+        assert not engine._circuit_breaker_active
+        assert not engine.is_kill_switch_active()
+
+    def test_circuit_breaker_does_not_clear_without_recovery(self) -> None:
+        """CB stays active when equity hasn't recovered from trough."""
+        limits = RiskLimits(
+            reference_capital=Decimal("100"),
+            circuit_breaker_drawdown_pct=Decimal("0.05"),
+            circuit_breaker_cooldown_minutes=0,
+            circuit_breaker_reentry_equity_recovery_pct=Decimal("0.05"),
+        )
+        engine = RiskEngine(limits=limits)
+        engine.update_equity(Decimal("90"))  # 10% drawdown → trip
+        assert engine._circuit_breaker_active
+
+        engine.update_equity(Decimal("91"))  # small recovery, below threshold
+        assert engine._circuit_breaker_active, "CB should stay active (recovery < 5%)"
+
+
+class TestPositionSizingByQuality:
+
+    def test_high_confidence_and_setup_sizes_full(self) -> None:
+        """High confidence + high setup score → full size."""
+        engine = RiskEngine()
+        decision = make_long_decision(confidence=Decimal("0.90"))
+        result = engine.evaluate(decision, setup_score=85)
+        assert result.approved_quantity > 0
+
+    def test_low_confidence_reduces_size(self) -> None:
+        """Low confidence → smaller position."""
+        engine = RiskEngine()
+        decision = make_long_decision(confidence=Decimal("0.55"))
+        result = engine.evaluate(decision, setup_score=50)
+        high = make_long_decision(confidence=Decimal("0.90"))
+        result_high = engine.evaluate(high, setup_score=85)
+        assert result.approved_quantity <= result_high.approved_quantity
+
+    def test_daily_loss_reduces_size(self) -> None:
+        """Daily loss at warn threshold → size reduction."""
+        limits = RiskLimits(
+            reference_capital=Decimal("100"),
+            max_risk_per_trade_pct=Decimal("0.01"),
+            max_position_size_pct=Decimal("1.0"),
+            daily_loss_warn_pct=Decimal("0.03"),
+            daily_loss_strong_pct=Decimal("0.04"),
+            daily_loss_block_pct=Decimal("0.05"),
+        )
+        engine = RiskEngine(limits=limits)
+        engine.record_daily_pnl(Decimal("-3.50"))
+        decision = make_long_decision(confidence=Decimal("0.90"))
+        result = engine.evaluate(decision, setup_score=80)
+        assert result.approved_quantity > 0
+
+        engine2 = RiskEngine(limits=limits)
+        decision2 = make_long_decision(confidence=Decimal("0.90"))
+        result2 = engine2.evaluate(decision2, setup_score=80)
+        assert result.approved_quantity <= result2.approved_quantity

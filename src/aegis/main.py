@@ -360,6 +360,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <div class="value" id="risk-kill-status" style="font-size:14px">--</div>
                         <div class="label">Kill Switch</div>
                     </div>
+                    <div class="metric">
+                        <div class="value" id="risk-episode" style="font-size:12px;color:#888">--</div>
+                        <div class="label">Episódio Halt</div>
+                    </div>
+                    <div class="metric">
+                        <div class="value" id="risk-recon-status" style="font-size:14px">--</div>
+                        <div class="label">Reconciliação</div>
+                    </div>
+                    <div class="metric">
+                        <div class="value" id="risk-halt-reason" style="font-size:12px;color:#ffaa00;max-width:200px;word-wrap:break-word">--</div>
+                        <div class="label">Motivo do Halt</div>
+                    </div>
+                    <div class="metric">
+                        <div class="value" id="risk-pending-action" style="font-size:14px">--</div>
+                        <div class="label">Pending Action</div>
+                    </div>
                 </div>
             </div>
             <div class="card">
@@ -778,6 +794,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.getElementById('risk-longonly-status').style.color = rl.long_only ? '#00ff88' : '#ffaa00';
             document.getElementById('risk-kill-status').textContent = state.kill_switch ? 'ATIVADO' : 'Desligado';
             document.getElementById('risk-kill-status').style.color = state.kill_switch ? '#ff4444' : '#00ff88';
+            // Kill switch episode + reconciliation + halt reason + pending action (Vibe patterns)
+            document.getElementById('risk-episode').textContent = state.kill_switch_episode ? String(state.kill_switch_episode).slice(0, 8) : '—';
+            const recEl = document.getElementById('risk-recon-status');
+            recEl.textContent = state.reconciliation_status || '—';
+            recEl.style.color = state.reconciled ? '#00ff88' : '#ff4444';
+            const haltEl = document.getElementById('risk-halt-reason');
+            haltEl.textContent = state.halt_reason || '—';
+            haltEl.style.color = state.halt_reason ? '#ffaa00' : '#888';
+            const pendingEl = document.getElementById('risk-pending-action');
+            if (state.pending_action) {
+                pendingEl.textContent = state.pending_action_phase || 'PENDENTE';
+                pendingEl.style.color = '#ff4444';
+            } else {
+                pendingEl.textContent = '—';
+                pendingEl.style.color = '#00ff88';
+            }
             // Exposure bar
             const exposure = parseFloat(state.exposure) || 0;
             const exposurePct = capital > 0 ? (exposure / capital * 100) : 0;

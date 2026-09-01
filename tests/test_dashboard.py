@@ -115,3 +115,79 @@ def test_frontend_cannot_alter_safety_limits() -> None:
     service = DashboardService()
     assert not hasattr(service, "set_risk_limit")
     assert not hasattr(service, "modify_risk_rules")
+
+
+# ============================================================
+# Vibe patterns — dashboard risk observability
+# ============================================================
+
+
+class TestDashboardRiskObservability:
+
+    def test_risk_status_carries_halt_reason_and_episode(self) -> None:
+        """Vibe: DashboardRiskStatus exposes halt_reason + kill_switch_episode."""
+        risk = DashboardRiskStatus(
+            kill_switch_active=True,
+            kill_switch_episode="ep-1234",
+            halt_reason="ORPHAN_ORDER: order_ex-1 — active order unknown locally",
+            reconciled=False,
+            reconciliation_status="DIVERGED",
+        )
+        assert risk.kill_switch_active
+        assert risk.kill_switch_episode == "ep-1234"
+        assert "ORPHAN_ORDER" in risk.halt_reason
+        assert not risk.reconciled
+        assert risk.reconciliation_status == "DIVERGED"
+
+    def test_risk_status_defaults_safe(self) -> None:
+        """Vibe: default DashboardRiskStatus is safe (reconciled, no halt)."""
+        risk = DashboardRiskStatus()
+        assert risk.kill_switch_active is False
+        assert risk.kill_switch_episode is None
+        assert risk.halt_reason is None
+        assert risk.reconciled is True
+        assert risk.reconciliation_status == "SKIPPED"
+
+    def test_worker_state_exposes_halt_and_deltas(self, tmp_path) -> None:
+        """Vibe: worker.state exposes halt_reason, deltas, episode, pending_action."""
+        import aegis.worker as worker_mod
+        from aegis.worker import AutonomousWorker
+        from aegis.reconciliation import (
+            ReconciliationEngine, ExchangeSnapshot, ExchangeBalance,
+            LocalSnapshot, ReconciliationStatus,
+        )
+
+        original_state = worker_mod._STATE_FILE
+        original_settings = worker_mod._SETTINGS_FILE
+        original_prompt = worker_mod._PROMPT_FILE
+        try:
+            worker_mod._STATE_FILE = tmp_path / "state.json"
+            worker_mod._SETTINGS_FILE = tmp_path / "test.env"
+            worker_mod._PROMPT_FILE = tmp_path / "prompt.txt"
+            w = AutonomousWorker()
+            w.risk_engine.activate_kill_switch("ep-abc")
+
+            # Run a reconciliation that diverges on cash so halt_reason is set.
+            engine = ReconciliationEngine()
+            local = LocalSnapshot(capital=Decimal("100"))
+            exchange = ExchangeSnapshot(
+                status="VALID",
+                balances=[ExchangeBalance("BRL", Decimal("80"), Decimal("0"))],
+            )
+            result = engine.reconcile(local, exchange)
+            assert result.requires_halt
+            w._reconciliation_status = result.status.value
+            w._reconciled = result.is_reconciled
+            w._last_reconciliation = result
+
+            s = w.state
+            assert s["kill_switch_active"] is True
+            assert s["kill_switch_episode"] == "ep-abc"
+            assert s["halt_reason"] is not None
+            assert "CASH_MISMATCH" in s["halt_reason"]
+            assert any(d["kind"] == "CASH_MISMATCH" for d in s["reconciliation_deltas"])
+            assert "pending_action" in s
+        finally:
+            worker_mod._STATE_FILE = original_state
+            worker_mod._SETTINGS_FILE = original_settings
+            worker_mod._PROMPT_FILE = original_prompt

@@ -143,6 +143,8 @@ class BacktestResult:
     recovery_factor: Decimal = Decimal("0")
     avg_holding_time: Decimal = Decimal("0")
     total_fees: Decimal = Decimal("0")
+    avg_mfe_r: Decimal = Decimal("0")
+    avg_mae_r: Decimal = Decimal("0")
 
 
 class BacktestEngineV2:
@@ -241,6 +243,7 @@ class BacktestEngineV2:
                                 "volume_trend": market_state.get("volume_trend", "NORMAL"),
                                 "volatility": Decimal(str(market_state.get("volatility", "0"))),
                                 "highest_price": entry_price,
+                                "lowest_price": entry_price,
                                 "break_even_activated": False,
                                 "trailing_activated": False,
                                 "current_stop": decision["stop_loss"],
@@ -272,6 +275,11 @@ class BacktestEngineV2:
             risk = position["entry_price"] - position["stop_loss"]
             realized_r = (exit_price - position["entry_price"]) / risk if risk > 0 else Decimal("0")
 
+            highest = position.get("highest_price", position["entry_price"])
+            lowest = position.get("lowest_price", position["entry_price"])
+            mfe_r = (highest - position["entry_price"]) / risk if risk > 0 else Decimal("0")
+            mae_r = (position["entry_price"] - lowest) / risk if risk > 0 else Decimal("0")
+
             trade = TradeRecord(
                 symbol=symbol,
                 entry_time=position["entry_time"],
@@ -288,10 +296,12 @@ class BacktestEngineV2:
                 momentum=position["momentum"],
                 volume_trend=position["volume_trend"],
                 volatility=position["volatility"],
-                risk_reward= self._calculate_rr(position),
+                risk_reward=self._calculate_rr(position),
                 position_size=position["quantity"] * position["entry_price"],
                 realized_pnl=(exit_price - position["entry_price"]) * position["quantity"] - fee,
                 realized_r=realized_r,
+                mfe=mfe_r,
+                mae=mae_r,
                 holding_time=len(candles) - 1,
                 exit_reason="END_OF_DATA",
                 fees=fee,
@@ -480,9 +490,11 @@ class BacktestEngineV2:
         tp = position["take_profit"]
         qty = position["quantity"]
 
-        # Update highest price
+        # Update highest and lowest price (MFE/MAE tracking)
         if current_price > position["highest_price"]:
             position["highest_price"] = current_price
+        if current_price < position.get("lowest_price", current_price):
+            position["lowest_price"] = current_price
 
         # Calculate R
         risk = entry - position["stop_loss"]
@@ -523,18 +535,24 @@ class BacktestEngineV2:
         # Check stop loss hit (using low price for intra-candle)
         if candle.low <= stop:
             exit_price = self._apply_slippage(stop, "SELL")
-            return self._close_position(position, exit_price, candle.timestamp.isoformat(), "STOP_LOSS")
+            ts = candle.timestamp.isoformat()
+            return self._close_position(position, exit_price, ts, "STOP_LOSS")
 
         # Check take profit hit (using high price for intra-candle)
         if candle.high >= tp:
             exit_price = self._apply_slippage(tp, "SELL")
-            return self._close_position(position, exit_price, candle.timestamp.isoformat(), "TAKE_PROFIT")
+            ts = candle.timestamp.isoformat()
+            return self._close_position(position, exit_price, ts, "TAKE_PROFIT")
 
         return position, None
 
     def _close_position(self, position: dict[str, Any], exit_price: Decimal,
                         exit_time: str, reason: str) -> tuple[None, dict[str, Any]]:
-        """Close position and generate trade record."""
+        """Close position and generate trade record.
+
+        Computes MFE/MAE (in R multiples) from the position's highest/lowest
+        price — key loss-mitigation / profit-optimization metrics.
+        """
         entry = position["entry_price"]
         qty = position["quantity"]
         proceeds = exit_price * qty
@@ -542,6 +560,11 @@ class BacktestEngineV2:
 
         risk = entry - position["stop_loss"]
         realized_r = (exit_price - entry) / risk if risk > 0 else Decimal("0")
+
+        highest = position.get("highest_price", entry)
+        lowest = position.get("lowest_price", entry)
+        mfe_r = (highest - entry) / risk if risk > 0 else Decimal("0")
+        mae_r = (entry - lowest) / risk if risk > 0 else Decimal("0")
 
         trade = TradeRecord(
             symbol="",
@@ -563,6 +586,8 @@ class BacktestEngineV2:
             position_size=entry * qty,
             realized_pnl=(exit_price - entry) * qty - fee,
             realized_r=realized_r,
+            mfe=mfe_r,
+            mae=mae_r,
             exit_reason=reason,
             fees=fee,
         )
@@ -607,6 +632,10 @@ class BacktestEngineV2:
 
         if result.gross_loss > 0:
             result.profit_factor = result.gross_profit / result.gross_loss
+        elif result.gross_profit > 0:
+            # No losses → profit factor is undefined/infinite; cap at a large
+            # sentinel so sorting/comparison stays well-behaved.
+            result.profit_factor = Decimal("9999")
 
         if wins:
             result.avg_win = sum(wins) / Decimal(str(len(wins)))
@@ -626,6 +655,14 @@ class BacktestEngineV2:
             mid = len(sorted_r) // 2
             result.median_r = sorted_r[mid]
 
+        # MFE/MAE averages (profit optimization + loss mitigation signals)
+        mfe_vals = [t.mfe for t in trades if t.mfe != 0]
+        mae_vals = [t.mae for t in trades if t.mae != 0]
+        if mfe_vals:
+            result.avg_mfe_r = sum(mfe_vals) / Decimal(str(len(mfe_vals)))
+        if mae_vals:
+            result.avg_mae_r = sum(mae_vals) / Decimal(str(len(mae_vals)))
+
         # Consecutive wins/losses
         max_wins = 0
         max_losses = 0
@@ -644,9 +681,9 @@ class BacktestEngineV2:
         result.max_consecutive_losses = max_losses
 
         # Max drawdown from equity curve
+        peak = result.equity_curve[0] if result.equity_curve else result.config.initial_capital
+        max_dd = Decimal("0")
         if result.equity_curve:
-            peak = result.equity_curve[0]
-            max_dd = Decimal("0")
             for eq in result.equity_curve:
                 if eq > peak:
                     peak = eq
@@ -655,9 +692,12 @@ class BacktestEngineV2:
                     max_dd = dd
             result.max_drawdown = max_dd * 100
 
-        # Recovery factor
-        if result.max_drawdown > 0:
-            result.recovery_factor = result.net_profit / (result.max_drawdown * result.config.initial_capital / Decimal("100"))
+        # Recovery factor: net_profit / absolute max drawdown in currency.
+        # Using the actual peak equity (not initial capital) is financially correct.
+        if result.max_drawdown > 0 and peak > 0:
+            max_dd_currency = result.max_drawdown * peak / Decimal("100")
+            if max_dd_currency > 0:
+                result.recovery_factor = result.net_profit / max_dd_currency
 
         # Average holding time
         holding_times = [t.holding_time for t in trades if t.holding_time > 0]
