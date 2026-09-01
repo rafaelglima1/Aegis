@@ -8,18 +8,19 @@ from uuid import uuid4
 import pytest
 
 from aegis.reconciliation import (
+    DeltaKind,
+    DivergenceSeverity,
     ExchangeBalance,
     ExchangeOrder,
     ExchangeSnapshot,
-    LocalSnapshot,
-    LocalPosition,
     LocalOrder,
+    LocalPosition,
+    LocalSnapshot,
+    ReconciliationDelta,
     ReconciliationEngine,
     ReconciliationResult,
     ReconciliationStatus,
-    DivergenceSeverity,
 )
-
 
 # ============================================================
 # Exchange Snapshot
@@ -221,9 +222,9 @@ class TestSandboxBrokerSnapshot:
     @pytest.mark.asyncio
     async def test_sandbox_snapshot_after_trade(self) -> None:
         """Sandbox snapshot reflects trades."""
-        from aegis.execution.sandbox import SandboxBroker
-        from aegis.execution.broker import OrderSubmission
         from aegis.domain.enums import OrderSide
+        from aegis.execution.broker import OrderSubmission
+        from aegis.execution.sandbox import SandboxBroker
 
         broker = SandboxBroker(initial_balance=Decimal("1000"))
         sub = OrderSubmission(
@@ -239,3 +240,157 @@ class TestSandboxBrokerSnapshot:
         btc = snap.get_balance("BTC")
         assert btc is not None
         assert btc.available > 0
+
+
+# ============================================================
+# DeltaKind Classification (borrowed from Vibe-Trading)
+# ============================================================
+
+
+class TestDeltaKindClassification:
+
+    def test_reconciled_has_no_deltas_and_no_halt(self) -> None:
+        """RECONCILED → no deltas, no halt, halt_reason=None."""
+        engine = ReconciliationEngine()
+        local = LocalSnapshot(capital=Decimal("100"))
+        exchange = ExchangeSnapshot(
+            status="VALID",
+            balances=[ExchangeBalance("BRL", Decimal("100"), Decimal("0"))],
+        )
+        result = engine.reconcile(local, exchange)
+        assert result.status == ReconciliationStatus.RECONCILED
+        assert result.deltas == []
+        assert result.requires_halt is False
+        assert result.halt_reason is None
+
+    def test_cash_mismatch_delta_kind(self) -> None:
+        """Cash divergence → CASH_MISMATCH delta, requires_halt."""
+        engine = ReconciliationEngine()
+        local = LocalSnapshot(capital=Decimal("100"))
+        exchange = ExchangeSnapshot(
+            status="VALID",
+            balances=[ExchangeBalance("BRL", Decimal("80"), Decimal("0"))],
+        )
+        result = engine.reconcile(local, exchange)
+        assert result.status == ReconciliationStatus.DIVERGED
+        assert result.requires_halt is True
+        kinds = {d.kind for d in result.deltas}
+        assert DeltaKind.CASH_MISMATCH in kinds
+        assert result.halt_reason is not None
+        assert "CASH_MISMATCH" in result.halt_reason
+        assert "cash_brl" in result.halt_reason
+
+    def test_position_mismatch_delta_kind(self) -> None:
+        """Position > exchange balance → POSITION_MISMATCH delta."""
+        engine = ReconciliationEngine()
+        local = LocalSnapshot(
+            capital=Decimal("50"),
+            positions=[LocalPosition("BTC-BRL", Decimal("0.01"), Decimal("50000"), "OPEN")],
+        )
+        exchange = ExchangeSnapshot(
+            status="VALID",
+            balances=[
+                ExchangeBalance("BRL", Decimal("50"), Decimal("0")),
+                ExchangeBalance("BTC", Decimal("0.005"), Decimal("0")),
+            ],
+        )
+        result = engine.reconcile(local, exchange)
+        assert result.requires_halt is True
+        kinds = {d.kind for d in result.deltas}
+        assert DeltaKind.POSITION_MISMATCH in kinds
+
+    def test_orphan_order_delta_kind(self) -> None:
+        """Exchange order unknown locally → ORPHAN_ORDER delta."""
+        engine = ReconciliationEngine()
+        local = LocalSnapshot(capital=Decimal("100"))
+        exchange = ExchangeSnapshot(
+            status="VALID",
+            balances=[ExchangeBalance("BRL", Decimal("100"), Decimal("0"))],
+            open_orders=[ExchangeOrder("ex-orphan", "BTC-BRL", "BUY", Decimal("0.001"))],
+        )
+        result = engine.reconcile(local, exchange)
+        assert result.status == ReconciliationStatus.DIVERGED
+        assert result.requires_halt is True
+        kinds = {d.kind for d in result.deltas}
+        assert DeltaKind.ORPHAN_ORDER in kinds
+        assert "ex-orphan" in result.halt_reason
+
+    def test_mid_order_ambiguous_delta_kind(self) -> None:
+        """Local pending order not on exchange → MID_ORDER_AMBIGUOUS (UNKNOWN)."""
+        engine = ReconciliationEngine()
+        local = LocalSnapshot(
+            capital=Decimal("100"),
+            orders=[LocalOrder("local-1", "BTC-BRL", "BUY", Decimal("0.001"), "SUBMITTED")],
+        )
+        exchange = ExchangeSnapshot(
+            status="VALID",
+            balances=[ExchangeBalance("BRL", Decimal("100"), Decimal("0"))],
+        )
+        result = engine.reconcile(local, exchange)
+        assert result.status == ReconciliationStatus.UNKNOWN
+        assert result.requires_halt is True
+        kinds = {d.kind for d in result.deltas}
+        assert DeltaKind.MID_ORDER_AMBIGUOUS in kinds
+        assert result.halt_reason is not None
+        assert "local-1" in result.halt_reason
+
+    def test_brl_locked_unknown_delta_kind_is_cash_mismatch(self) -> None:
+        """BRL locked not explainable → CASH_MISMATCH (not MID_ORDER)."""
+        engine = ReconciliationEngine()
+        local = LocalSnapshot(capital=Decimal("100"))
+        exchange = ExchangeSnapshot(
+            status="VALID",
+            balances=[ExchangeBalance("BRL", Decimal("50"), Decimal("50"))],
+        )
+        result = engine.reconcile(local, exchange)
+        assert result.status == ReconciliationStatus.UNKNOWN
+        assert result.requires_halt is True
+        kinds = {d.kind for d in result.deltas}
+        assert DeltaKind.CASH_MISMATCH in kinds
+        assert DeltaKind.MID_ORDER_AMBIGUOUS not in kinds
+
+    def test_error_snapshot_requires_halt(self) -> None:
+        """ERROR snapshot → requires_halt True, halt_reason = error."""
+        engine = ReconciliationEngine()
+        local = LocalSnapshot(capital=Decimal("100"))
+        exchange = ExchangeSnapshot(status="ERROR", error="Exchange query failed")
+        result = engine.reconcile(local, exchange)
+        assert result.status == ReconciliationStatus.ERROR
+        assert result.requires_halt is True
+        assert result.halt_reason == "Exchange query failed"
+
+    def test_unknown_snapshot_requires_halt(self) -> None:
+        """UNKNOWN snapshot → requires_halt True."""
+        engine = ReconciliationEngine()
+        local = LocalSnapshot(capital=Decimal("100"))
+        exchange = ExchangeSnapshot(status="UNKNOWN")
+        result = engine.reconcile(local, exchange)
+        assert result.status == ReconciliationStatus.UNKNOWN
+        assert result.requires_halt is True
+
+    def test_summary_includes_deltas(self) -> None:
+        """summary() exposes the classified delta kinds."""
+        engine = ReconciliationEngine()
+        local = LocalSnapshot(capital=Decimal("100"))
+        exchange = ExchangeSnapshot(
+            status="VALID",
+            balances=[ExchangeBalance("BRL", Decimal("80"), Decimal("0"))],
+        )
+        result = engine.reconcile(local, exchange)
+        s = result.summary()
+        assert "deltas=[" in s
+        assert "CASH_MISMATCH" in s
+        assert "halt=" in s
+
+    def test_reconciliation_delta_blocks_trading_flag(self) -> None:
+        """ReconciliationDelta carries blocks_trading."""
+        delta = ReconciliationDelta(
+            kind=DeltaKind.ORPHAN_ORDER,
+            entity="order_ex-1",
+            local_value="NOT_LOCAL",
+            exchange_value="BUY 0.001 BTC-BRL",
+            message="Exchange has active order unknown locally",
+        )
+        assert delta.blocks_trading is True
+        assert delta.kind == DeltaKind.ORPHAN_ORDER
+        assert delta.entity == "order_ex-1"

@@ -35,6 +35,26 @@ class DivergenceSeverity(str, Enum):
     INFO = "INFO"              # informational
 
 
+class DeltaKind(str, Enum):
+    """Classification of a single reconciliation delta.
+
+    Adapted from Vibe-Trading's reconcile delta kinds — each delta between
+    exchange truth and local state is classified so an operator can see WHY
+    trading was halted, not just that it was.
+
+    - CASH_MISMATCH:      local cash/BRL does not match exchange BRL.
+    - POSITION_MISMATCH:  local asset position does not match exchange balance.
+    - ORPHAN_ORDER:       exchange has an open order unknown locally.
+    - MID_ORDER_AMBIGUOUS: a local pending/unknown order cannot be resolved
+                           against the exchange (may have filled, rejected, or
+                           vanished) — the crash/mid-order case.
+    """
+    CASH_MISMATCH = "CASH_MISMATCH"
+    POSITION_MISMATCH = "POSITION_MISMATCH"
+    ORPHAN_ORDER = "ORPHAN_ORDER"
+    MID_ORDER_AMBIGUOUS = "MID_ORDER_AMBIGUOUS"
+
+
 # ============================================================
 # Exchange Snapshot
 # ============================================================
@@ -157,6 +177,21 @@ class Divergence:
     message: str = ""
 
 
+@dataclass
+class ReconciliationDelta:
+    """A classified delta between exchange truth and local state.
+
+    Carries the WHY behind a halted reconciliation, keyed by ``kind`` and
+    the affected entity (``cash_brl``, ``position_BTC``, ``order_<id>``).
+    """
+    kind: DeltaKind
+    entity: str
+    local_value: Any
+    exchange_value: Any
+    message: str = ""
+    blocks_trading: bool = True
+
+
 # ============================================================
 # Reconciliation Result
 # ============================================================
@@ -167,6 +202,7 @@ class ReconciliationResult:
     """Result of comparing local state against exchange state."""
     status: ReconciliationStatus = ReconciliationStatus.UNKNOWN
     divergences: list[Divergence] = field(default_factory=list)
+    deltas: list[ReconciliationDelta] = field(default_factory=list)
     exchange_snapshot: ExchangeSnapshot | None = None
     local_snapshot: LocalSnapshot | None = None
     error: str | None = None
@@ -182,10 +218,41 @@ class ReconciliationResult:
             for d in self.divergences
         )
 
+    @property
+    def requires_halt(self) -> bool:
+        """Trading must halt when the local state cannot be trusted.
+
+        RECONCILED is the only non-halting state. DIVERGED (known mismatch),
+        UNKNOWN (cannot determine), and ERROR all require halting.
+        """
+        return not self.is_reconciled
+
+    @property
+    def halt_reason(self) -> str | None:
+        """Human-readable WHY behind a halt, or None when safe to trade.
+
+        Prefers the classified delta that blocks trading; falls back to the
+        raw error/status. This is the operational value of DeltaKind — an
+        operator sees *which order/asset/cash* caused the halt.
+        """
+        if not self.requires_halt:
+            return None
+        if self.error:
+            return self.error
+        for d in self.deltas:
+            if d.blocks_trading:
+                return f"{d.kind.value}: {d.entity} — {d.message}"
+        return f"status={self.status.value}"
+
     def summary(self) -> str:
         parts = [f"status={self.status.value}"]
+        if self.requires_halt:
+            parts.append(f"halt={self.halt_reason}")
         if self.divergences:
             parts.append(f"divergences={len(self.divergences)}")
+        if self.deltas:
+            kinds = ",".join(d.kind.value for d in self.deltas)
+            parts.append(f"deltas=[{kinds}]")
         if self.error:
             parts.append(f"error={self.error}")
         return " ".join(parts)
@@ -204,15 +271,19 @@ class ReconciliationEngine:
 
     def __init__(self) -> None:
         self._unknown_reason: str | None = None
+        self._unknown_kind: DeltaKind | None = None
 
-    def _set_unknown(self, reason: str) -> None:
+    def _set_unknown(self, reason: str, kind: DeltaKind | None = None) -> None:
         """Mark that the local model lacks information for a safe verdict.
 
         P0-07/P0-13: NUNCA assumir zero. When we cannot determine a divergence
         with safety, the result is UNKNOWN and trading is blocked.
+        ``kind`` classifies the delta for ``halt_reason`` (default
+        MID_ORDER_AMBIGUOUS for order-level, CASH_MISMATCH for balance-level).
         """
         if self._unknown_reason is None:
             self._unknown_reason = reason
+            self._unknown_kind = kind
 
     def reconcile(
         self,
@@ -224,6 +295,7 @@ class ReconciliationEngine:
         Returns RECONCILED, DIVERGED, UNKNOWN, or ERROR.
         """
         self._unknown_reason = None
+        self._unknown_kind = None
         result = ReconciliationResult(
             exchange_snapshot=exchange,
             local_snapshot=local,
@@ -253,6 +325,7 @@ class ReconciliationEngine:
         if self._unknown_reason is not None:
             result.status = ReconciliationStatus.UNKNOWN
             result.error = self._unknown_reason
+            result.deltas = self._build_deltas(divergences)
             return result
 
         if not divergences:
@@ -263,7 +336,58 @@ class ReconciliationEngine:
             # Warnings only — still RECONCILED but with notes
             result.status = ReconciliationStatus.RECONCILED
 
+        result.deltas = self._build_deltas(divergences)
         return result
+
+    def _build_deltas(
+        self,
+        divergences: list[Divergence],
+    ) -> list[ReconciliationDelta]:
+        """Classify divergences + unknown state into classified deltas.
+
+        Each divergence is mapped to a DeltaKind based on its field name.
+        An unresolved ``_unknown_reason`` produces a MID_ORDER_AMBIGUOUS or
+        CASH_MISMATCH delta depending on the kind passed to ``_set_unknown``.
+        """
+        deltas: list[ReconciliationDelta] = []
+
+        for d in divergences:
+            kind = self._kind_for_divergence(d)
+            if kind is not None:
+                deltas.append(ReconciliationDelta(
+                    kind=kind,
+                    entity=d.field,
+                    local_value=d.local_value,
+                    exchange_value=d.exchange_value,
+                    message=d.message,
+                    blocks_trading=(d.severity == DivergenceSeverity.CRITICAL),
+                ))
+
+        if self._unknown_reason is not None:
+            # If the unknown was tagged as CASH_MISMATCH, use that;
+            # otherwise default to MID_ORDER_AMBIGUOUS (order-level ambiguity).
+            uk = self._unknown_kind or DeltaKind.MID_ORDER_AMBIGUOUS
+            deltas.append(ReconciliationDelta(
+                kind=uk,
+                entity="*",
+                local_value="LOCAL_STATE",
+                exchange_value="UNKNOWN",
+                message=self._unknown_reason,
+                blocks_trading=True,
+            ))
+
+        return deltas
+
+    @staticmethod
+    def _kind_for_divergence(d: Divergence) -> DeltaKind | None:
+        """Map a divergence field name to its DeltaKind."""
+        if d.field == "cash_brl":
+            return DeltaKind.CASH_MISMATCH
+        if d.field.startswith("position_"):
+            return DeltaKind.POSITION_MISMATCH
+        if d.field.startswith("order_") and d.local_value == "NOT_LOCAL":
+            return DeltaKind.ORPHAN_ORDER
+        return None
 
     def _reconcile_balances(
         self,
@@ -298,7 +422,8 @@ class ReconciliationEngine:
                 # Exchange holds BRL we cannot account for → can't determine safely
                 self._set_unknown(
                     "Exchange reports BRL locked but local model has no cash_locked "
-                    "or pending BUY reservation to explain it"
+                    "or pending BUY reservation to explain it",
+                    kind=DeltaKind.CASH_MISMATCH,
                 )
 
         # Local cash vs exchange BRL (available + locked attributable to us)
